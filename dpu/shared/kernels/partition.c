@@ -303,19 +303,19 @@ int kernel_partition(uint32_t tasklet_id, barrier_t* barrier, uint32_t nr_partit
     *histogram_wram = (uint32_t*)mem_alloc((nr_partitions + 1) * sizeof(uint32_t));
     for(uint32_t i = 0; i < nr_partitions + 1; ++i)
       (*histogram_wram)[i] = 0;
-    /*perfcounter_config(COUNT_CYCLES, true);*/
+    perfcounter_config(COUNT_INSTRUCTIONS, true);
     cache.cache_item = (T*)mem_alloc(nr_partitions * sizeof(T));
     cache.cache_indice = (uint32_t*)mem_alloc(nr_partitions * sizeof(uint32_t));
   }
   barrier_wait(barrier);
 
   T* input_cache = (T*)mem_alloc(BLOCK_SIZE_IN_BYTES);
-  /*printf("build histogram: cache %p\n", input_cache);*/
+  printf("build histogram: cache %p\n", input_cache);
   build_histogram(tasklet_id, nr_partitions, *histogram_wram, input_cache, buffer, buffer_length);
 
   barrier_wait(barrier);
-  /*if(me() == 0)*/
-    /*printf("cycles hist %lu\n", perfcounter_get());*/
+  if(me() == 0)
+    printf("cycles hist %lu\n", perfcounter_get());
 
   /*printf("prefix\n");*/
   prefix_sum(tasklet_id, *histogram_wram, nr_partitions, barrier);
@@ -328,14 +328,14 @@ int kernel_partition(uint32_t tasklet_id, barrier_t* barrier, uint32_t nr_partit
     nb_elem_input = buffer_length;
   }
   barrier_wait(barrier);
-  /*if(me() == 0)*/
-    /*printf("cycles prefix %lu\n", perfcounter_get());*/
+  if(me() == 0)
+    printf("cycles prefix %lu\n", perfcounter_get());
 
-  /*printf("partition\n");*/
+  printf("partition\n");
   partition_array(tasklet_id, nr_partitions, selection_indices_vector, *histogram_wram, input_cache, buffer,
                   output_buffer, buffer_length, barrier);
   barrier_wait(barrier);
-  /*if(me() == 0)*/
-    /*printf("cycles part %lu\n", perfcounter_get());*/
+  if(me() == 0)
+    printf("cycles part %lu\n", perfcounter_get());
   return 0;
 }

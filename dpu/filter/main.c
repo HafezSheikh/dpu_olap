@@ -17,7 +17,7 @@
 // Buffer size
 // Note that if logging is enabled then 1MiB is reserved for the printf buffer so this
 // must be lowered to 7MiB or less
-#define BUFFER_LENGTH (8 << 20)                              // 8MiB items
+#define BUFFER_LENGTH (6 << 20)                              // 8MiB items
 #define BUFFER_SIZE_IN_BYTES (BUFFER_LENGTH << T_SIZE_LOG2)  // 32MiB
 
 // Buffers
@@ -37,7 +37,7 @@ int main() {
 
 #if ENABLE_PERF
   if (tasklet_id == 0) {
-    perfcounter_config(COUNT_CYCLES, true);
+    perfcounter_config(COUNT_INSTRUCTIONS, true);
   }
 #endif
 

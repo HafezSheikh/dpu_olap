@@ -6,15 +6,15 @@
 #endif
 
 #ifndef ENABLE_LOG
-#define ENABLE_LOG 0
+#define ENABLE_LOG 1
 #endif
 
 #ifndef ENABLE_TRACE
-#define ENABLE_TRACE 0
+#define ENABLE_TRACE 1
 #endif
 
 #ifndef HT_ENABLE_STATS
-#define HT_ENABLE_STATS 0
+#define HT_ENABLE_STATS 1
 #endif
 
 #ifndef HT_ENABLE_MULTILOCK

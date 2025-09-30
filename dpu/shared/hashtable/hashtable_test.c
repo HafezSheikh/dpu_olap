@@ -16,7 +16,7 @@ hash_table_t hashtable;
 
 __host uint32_t nb_cycles;
 
-#define HT_CAPACITY (2 << 20)
+#define HT_CAPACITY (1 << 20)
 #define HT_ITEMS (HT_CAPACITY >> 1)
 
 int main() {
@@ -24,7 +24,7 @@ int main() {
 
   // One time initialization
   if (tasklet_id == 0) {
-    perfcounter_config(COUNT_CYCLES, true);
+    perfcounter_config(COUNT_INSTRUCTIONS, true);
     mem_reset();  // Reset the heap
     mram_reset();
     ht_init(&hashtable, writer_mutex, HT_CAPACITY);
@@ -49,7 +49,7 @@ int main() {
 
   if (tasklet_id == 0) {
     nb_cycles = perfcounter_get();
-    printf("NR_TASKLETS=%d, nb_cycles=%d\n", NR_TASKLETS, nb_cycles);
+    printf("NR_TASKLETS=%d, nb_instructions=%d\n", NR_TASKLETS, nb_cycles);
 #if HT_ENABLE_STATS
     printf("#SLOW_PATH=%d, #ITEMS=%d, #DISTANCE=%d\n", hashtable.stats_total_slowpath,
            hashtable.stats_total_items, hashtable.stats_total_distance);

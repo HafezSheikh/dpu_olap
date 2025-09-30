@@ -1,5 +1,6 @@
 #include <arrow/api.h>
 #include <benchmark/benchmark.h>
+#include <algorithm>
 #include <iostream>
 
 #include "dpuext/api.h"
@@ -165,15 +166,69 @@ BENCHMARK_REGISTER_F(PartitionedBatchGeneratorFixture, BM_JoinNative)
     ->UseRealTime()
     ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_REGISTER_F(PartitionedBatchGeneratorFixture, BM_JoinDpu)
-    ->ArgNames({"Batches", "L-Batch-Size", "R-Batch-Size", "DPUs"})
-    ->Args({variables::scale_factor(), 2 << 20, 2 << 20,
-            std::min(variables::max_dpus(), variables::scale_factor())})
-    // ->Args({variables::scale_factor() << 5, 64 << 10, 64 << 10,
-    // std::min(variables::max_dpus(), variables::scale_factor() << 5)})
-    ->MeasureProcessCPUTime()
-    ->UseRealTime()
-    ->Unit(benchmark::kMillisecond);
+namespace {
+
+std::vector<std::vector<int64_t>> BuildJoinDpuArgumentMatrix() {
+  std::vector<std::vector<int64_t>> args;
+  const int64_t base_batches = std::max<int64_t>(1, variables::scale_factor());
+  const int64_t max_dpus = std::max<int64_t>(1, variables::max_dpus());
+  const int64_t default_dpus = std::max<int64_t>(1, std::min<int64_t>(max_dpus, 8));
+
+  auto push_args = [&](int64_t batches, int64_t left_rows, int64_t right_rows, int64_t dpus) {
+    if (batches <= 0 || left_rows <= 0 || right_rows <= 0 || dpus <= 0) {
+      return;
+    }
+    if (batches % dpus != 0) {
+      return;  // partitioner expects batches divisible by dpus
+    }
+    std::vector<int64_t> tuple{batches, left_rows, right_rows, dpus};
+    if (std::find(args.begin(), args.end(), tuple) == args.end()) {
+      args.emplace_back(std::move(tuple));
+    }
+  };
+
+  // Partition-size sweep (fixed DPUs)
+  push_args(base_batches, 128LL << 10, 128LL << 10, default_dpus);
+  push_args(base_batches, 256LL << 10, 256LL << 10, default_dpus);
+  push_args(base_batches, 512LL << 10, 512LL << 10, default_dpus);
+  push_args(base_batches, 1LL << 20, 1LL << 20, default_dpus);
+
+  // Scale-factor sweep (more partitions, same DPUs)
+  push_args(base_batches * 2, 256LL << 10, 256LL << 10, default_dpus);
+  push_args(base_batches * 4, 256LL << 10, 256LL << 10, default_dpus);
+
+  // DPU scaling (constant total rows, varying DPUs)
+  push_args(base_batches * 4, 256LL << 10, 256LL << 10,
+            std::max<int64_t>(1, default_dpus / 2));
+  push_args(base_batches * 4, 256LL << 10, 256LL << 10,
+            std::min<int64_t>(max_dpus, default_dpus * 2));
+
+  // Single-DPU baselines
+  push_args(1, 256LL << 10, 256LL << 10, 1);
+  push_args(2, 256LL << 10, 256LL << 10, 1);
+
+  // Ensure deterministic ordering for reporting
+  std::sort(args.begin(), args.end(), [](const auto& a, const auto& b) {
+    if (a[3] != b[3]) return a[3] < b[3];
+    if (a[0] != b[0]) return a[0] < b[0];
+    if (a[1] != b[1]) return a[1] < b[1];
+    return a[2] < b[2];
+  });
+
+  return args;
+}
+
+}  // namespace
+
+const auto kJoinDpuArgs = BuildJoinDpuArgumentMatrix();
+for (const auto& arg_tuple : kJoinDpuArgs) {
+  BENCHMARK_REGISTER_F(PartitionedBatchGeneratorFixture, BM_JoinDpu)
+      ->ArgNames({"Batches", "L-Batch-Size", "R-Batch-Size", "DPUs"})
+      ->Args(arg_tuple)
+      ->MeasureProcessCPUTime()
+      ->UseRealTime()
+      ->Unit(benchmark::kMillisecond);
+}
 
 }  // namespace join
 }  // namespace upmemeval
