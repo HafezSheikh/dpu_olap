@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arrow/api.h>
+#include <mutex>
 #include "timer/timer.h"
 
 #include "partition/partitioner.h"
@@ -35,6 +36,8 @@ class JoinDpu {
   arrow::RecordBatchVector left_batches_;
   arrow::RecordBatchVector right_batches_;
   std::shared_ptr<timer::Timers> timers_;
+  uint64_t bloom_skipped_total_ = 0;
+  mutable std::mutex bloom_mutex_;
 
   arrow::Result<std::shared_ptr<partition::Partitioner>> do_partition(
       int k_column_index,
@@ -45,6 +48,12 @@ class JoinDpu {
   void create_async_timers(const std::vector<std::string>& names);
   void start_async_timer(const std::string& name);
   void stop_async_timer(const std::string& name);
+
+ public:
+  uint64_t BloomSkipped() const {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    return bloom_skipped_total_;
+  }
 };
 
 }  // namespace join

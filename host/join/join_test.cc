@@ -98,7 +98,7 @@ TEST(JoinTest, LargeTest) {
   auto left_batches =
       generator::MakeRandomRecordBatches(rng, left_schema, num_batches, batch_size);
   auto left_fk_column =
-      generator::MakeForeignKeyColumn(rng, batch_size, num_batches, batch_size);
+      generator::MakeForeignKeyColumn(rng, batch_size, num_batches, batch_size, 0.0);
   left_batches = generator::AddColumn("fk", left_batches, left_fk_column.ValueOrDie());
   left_schema = left_batches[0]->schema();
 

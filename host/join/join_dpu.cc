@@ -323,7 +323,10 @@ arrow::Status JoinDpu::Prepare() {
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run() {
-
+  {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    bloom_skipped_total_ = 0;
+  }
   start_async_timer("outer");
   auto result = Run_internal();
   stop_async_timer("outer");
@@ -469,6 +472,22 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
                                              batches_offset, fk_column_index, true));
       // Execute DPU program asynchronously
       system_.async().exec();
+
+      system_.async().call([this](DpuSet& set, unsigned __attribute__((unused)) rank_id) -> void {
+        std::vector<std::vector<uint32_t>> bloom_counts(set.dpus().size());
+        for (auto& counts : bloom_counts) {
+          counts.resize(1);
+        }
+        set.copy(bloom_counts, "bloom_skipped");
+        uint64_t local = 0;
+        for (const auto& counts : bloom_counts) {
+          local += counts[0];
+        }
+        if (local > 0) {
+          std::lock_guard<std::mutex> lock(bloom_mutex_);
+          bloom_skipped_total_ += local;
+        }
+      });
 
       stop_async_timer("probe");
 

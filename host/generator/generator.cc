@@ -2,6 +2,11 @@
 
 #include <arrow/testing/random.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <random>
+
 namespace upmemeval {
 
 namespace generator {
@@ -45,14 +50,43 @@ arrow::RecordBatchVector AddColumn(const std::string& name,
 
 arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
     ::arrow::random::RandomArrayGenerator& g, uint32_t pk_batch_size, int32_t num_batches,
-    int32_t batch_size) {
+    int32_t batch_size, double outside_ratio,
+    std::pair<uint64_t, uint64_t>* counts) {
   arrow::ArrayVector out(num_batches);
-  for (uint32_t i = 0; i < (uint32_t)num_batches; ++i) {
-    auto metadata =
-        arrow::key_value_metadata({{"min", std::to_string(i * pk_batch_size)},
-                                   {"max", std::to_string((i + 1) * pk_batch_size - 1)}});
-    out[i] = g.ArrayOf(*arrow::field("fk", arrow::uint32(), false, metadata), batch_size);
+
+  std::mt19937_64 rng(42);
+  uint64_t total_inside = 0;
+  uint64_t total_outside = 0;
+
+  for (int32_t batch = 0; batch < num_batches; ++batch) {
+    arrow::UInt32Builder builder;
+    ARROW_RETURN_NOT_OK(builder.Reserve(batch_size));
+
+    uint32_t pk_base = static_cast<uint32_t>(batch) * pk_batch_size;
+    std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
+    std::uniform_int_distribution<uint32_t> inside_dist(0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
+    std::uniform_int_distribution<uint32_t> outside_dist(0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
+
+    for (int32_t row = 0; row < batch_size; ++row) {
+      uint32_t value;
+      if (pk_batch_size == 0 || prob_dist(rng) >= outside_ratio) {
+        value = pk_base + inside_dist(rng);
+        ++total_inside;
+      } else {
+        value = pk_base + pk_batch_size + outside_dist(rng);
+        ++total_outside;
+      }
+      builder.UnsafeAppend(value);
+    }
+
+    ARROW_ASSIGN_OR_RAISE(out[batch], builder.Finish());
   }
+
+  if (counts != nullptr) {
+    counts->first = total_inside;
+    counts->second = total_outside;
+  }
+
   return out;
 }
 

@@ -8,6 +8,12 @@
 
 #include "bloom.h"
 #include "common.h"  // for bloom_bits and bloom_n_bits
+#include <barrier.h>
+#include <mutex.h>
+
+extern mutex_id_t bloom_mutex;
+extern uint32_t bloom_skipped;
+extern barrier_t barrier;
 
 int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer_length,
                       hash_table_t* hashtable,
@@ -17,11 +23,18 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
   T* input_cache = (T*)mem_alloc(BLOCK_SIZE_IN_BYTES);
   uint32_t* output_cache = (uint32_t*)mem_alloc(BLOCK_LENGTH * sizeof(uint32_t));
 
+  if (tasklet_id == 0) {
+    bloom_skipped = 0;
+  }
+  barrier_wait(&barrier);
+
   // Bloom filter view
   bloom_t bf;
   if (bloom_n_bits > 0) {
     bloom_init(&bf, bloom_bits, bloom_n_bits);
   }
+
+  uint32_t skipped_local = 0;
 
   // Scan blocks
   trace("Tasklet %d kernel_hash_probe: scanning blocks\n", tasklet_id);
@@ -42,6 +55,7 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
       // Bloom check first
       if (bloom_n_bits > 0 && !bloom_maybe_contains_u64(&bf, (uint64_t)item)) {
         // Definitely not present
+        skipped_local++;
         output_cache[i] = UINT32_MAX;  // sentinel for "no match"
         continue;
       }
@@ -60,6 +74,17 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
   }
 
   trace("Tasklet %d kernel_hash_probe: done\n", tasklet_id);
+
+  barrier_wait(&barrier);
+  if (skipped_local > 0) {
+    mutex_lock(bloom_mutex);
+    bloom_skipped += skipped_local;
+    mutex_unlock(bloom_mutex);
+  }
+  if (tasklet_id == 0) {
+    trace("Tasklet %d bloom skipped local=%u total=%u\n", tasklet_id, skipped_local, bloom_skipped);
+  }
+  barrier_wait(&barrier);
 
   return 0;
 }

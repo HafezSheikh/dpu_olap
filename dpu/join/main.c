@@ -57,6 +57,7 @@ __host uint32_t output_buffer_length = 0;
 // adjust as needed
 __mram_noinit uint8_t bloom_bits[MAX_BLOOM_BITS / 8];
 __host uint32_t bloom_n_bits = 0; // actual n_bits used (host will set)
+__host uint32_t bloom_skipped = 0;
 
 // Shared hash table
 hash_table_t hashtable;
@@ -64,6 +65,7 @@ hash_table_t hashtable;
 // Synchronization
 BARRIER_INIT(barrier, NR_TASKLETS);
 MUTEX_INIT(writer_mutex);
+MUTEX_INIT(bloom_mutex);
 
 // Outputs
 __host uint32_t nb_cycles = 0;
