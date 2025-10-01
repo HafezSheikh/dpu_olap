@@ -94,9 +94,19 @@ Partitioner::~Partitioner() {}
       dpu::arrow_copy_to_dpus(system_, "buffer", batches, batches_offset, column_index));
   // Execute DPU program synchroniously
 #if ENABLE_LOG
-  system_.exec_with_log(std::cout);
+  try {
+    system_.exec_with_log(std::cout);
+  } catch (const dpu::DpuError& e) {
+    system_.log(std::cerr);
+    return arrow::Status::UnknownError(e.what());
+  }
 #else
-  system_.exec();
+  try {
+    system_.exec();
+  } catch (const dpu::DpuError& e) {
+    system_.log(std::cerr);
+    return arrow::Status::UnknownError(e.what());
+  }
 #endif
   // Get output parameters
   std::vector<std::vector<kernel_partition_outputs_t>> output_params(nr_dpus);
@@ -159,9 +169,19 @@ Partitioner::~Partitioner() {}
                                               column_index, true));
   // Execute DPU program synchroniously
 #if ENABLE_LOG
-  system_.exec_with_log(std::cout);
+  try {
+    system_.exec_with_log(std::cout);
+  } catch (const dpu::DpuError& e) {
+    system_.log(std::cerr);
+    return arrow::Status::UnknownError(e.what());
+  }
 #else
-  system_.async().exec();
+  try {
+    system_.async().exec();
+  } catch (const dpu::DpuError& e) {
+    system_.log(std::cerr);
+    return arrow::Status::UnknownError(e.what());
+  }
 #endif
   // Get output parameters
   system_.async().call([&dpu_offset, &metadata, nr_partitions, batches_offset](

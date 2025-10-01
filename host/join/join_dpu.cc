@@ -99,9 +99,15 @@ static inline BloomConfig GetBloomConfig() {
   BloomConfig cfg{};
   cfg.bits_per_key = static_cast<uint32_t>(std::max(1, variables::bloom_bits_per_key()));
   cfg.min_bits = static_cast<uint32_t>(std::max(1, variables::bloom_min_bits()));
-  cfg.max_bits = static_cast<uint32_t>(std::max(cfg.min_bits, variables::bloom_max_bits()));
-  cfg.min_partition_rows = static_cast<uint32_t>(std::max(0, variables::bloom_min_partition_rows()));
-  cfg.max_partition_rows = static_cast<uint32_t>(std::max(cfg.min_partition_rows, variables::bloom_max_partition_rows()));
+  const uint32_t configured_max_bits =
+      static_cast<uint32_t>(std::max(1, variables::bloom_max_bits()));
+  cfg.max_bits = std::max<uint32_t>(cfg.min_bits, configured_max_bits);
+  cfg.min_partition_rows =
+      static_cast<uint32_t>(std::max(0, variables::bloom_min_partition_rows()));
+  const uint32_t configured_max_partition_rows =
+      static_cast<uint32_t>(std::max(0, variables::bloom_max_partition_rows()));
+  cfg.max_partition_rows =
+      std::max<uint32_t>(cfg.min_partition_rows, configured_max_partition_rows);
   cfg.min_mismatch_rate = std::clamp(variables::bloom_min_mismatch_rate(), 0.0, 1.0);
   return cfg;
 }
