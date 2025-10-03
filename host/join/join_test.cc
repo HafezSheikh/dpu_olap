@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 #include <list>
 #include <string>
@@ -77,6 +78,54 @@ TEST(JoinTest, SimpleTest) {
   auto sorted_native = do_sort(native, {"v_l", "fk"}).ValueOrDie();
 
   EXPECT_TRUE(sorted_native->Equals(*sorted_dpu));
+}
+
+TEST(JoinTest, DropsMismatchedRows) {
+  const char* ratio_env = std::getenv("FK_OUTSIDE_RATIO");
+  setenv("FK_OUTSIDE_RATIO", "0.35", 1);
+
+  arrow::random::RandomArrayGenerator rng(7);
+  const int num_batches = 4;
+  const int batch_rows = 1024;
+  auto system_ = dpu::DpuSet::allocate(4, "sgXferEnable=true");
+
+  auto right_schema = arrow::schema({arrow::field("payload_r", arrow::uint32(), false)});
+  auto right_batches_base =
+      generator::MakeRandomRecordBatches(rng, right_schema, num_batches, batch_rows);
+  auto right_pk_column = generator::MakeIndexColumn(num_batches, batch_rows);
+  auto right_batches =
+      generator::AddColumn("pk", right_batches_base, right_pk_column.ValueOrDie());
+  right_schema = right_batches[0]->schema();
+
+  auto left_schema = arrow::schema({arrow::field("payload_l", arrow::uint32(), false)});
+  auto left_batches_base =
+      generator::MakeRandomRecordBatches(rng, left_schema, num_batches, batch_rows);
+  std::pair<uint64_t, uint64_t> counts{0, 0};
+  auto left_fk_column = generator::MakeForeignKeyColumn(
+                                   rng, static_cast<uint32_t>(batch_rows), num_batches,
+                                   batch_rows, 0.35, &counts)
+                               .ValueOrDie();
+  auto left_batches = generator::AddColumn("fk", left_batches_base, left_fk_column);
+  left_schema = left_batches[0]->schema();
+
+  auto native =
+      do_join(JoinNative{left_schema, right_schema, left_batches, right_batches}).ValueOrDie();
+  auto dpuEnabled =
+      do_join(JoinDpu{system_, left_schema, right_schema, left_batches, right_batches})
+          .ValueOrDie();
+
+  auto sorted_native = do_sort(native, {"fk", "payload_l"}).ValueOrDie();
+  auto sorted_dpu = do_sort(dpuEnabled, {"fk", "payload_l"}).ValueOrDie();
+
+  EXPECT_TRUE(sorted_native->Equals(*sorted_dpu));
+  EXPECT_EQ(sorted_native->num_rows(), static_cast<int64_t>(counts.first));
+  EXPECT_EQ(sorted_dpu->num_rows(), static_cast<int64_t>(counts.first));
+
+  if (ratio_env) {
+    setenv("FK_OUTSIDE_RATIO", ratio_env, 1);
+  } else {
+    unsetenv("FK_OUTSIDE_RATIO");
+  }
 }
 
 TEST(JoinTest, LargeTest) {

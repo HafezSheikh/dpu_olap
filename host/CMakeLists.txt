@@ -24,6 +24,7 @@ if(NOT NR_DPUS)
 endif()
 
 file(GLOB_RECURSE benchmark_source_list "*.cc" "*.h" "*.hpp")
+list(FILTER benchmark_source_list EXCLUDE REGEX "paper_join/.*")
 list(FILTER benchmark_source_list EXCLUDE REGEX ".*_test.cc")
 add_executable(${PROJECT_NAME} ${benchmark_source_list})
 target_include_directories(
@@ -39,6 +40,7 @@ target_link_libraries(
 
 enable_testing()
 file(GLOB_RECURSE test_source_list "*.cc" "*.h" "*.hpp")
+list(FILTER test_source_list EXCLUDE REGEX "paper_join/.*")
 list(FILTER test_source_list EXCLUDE REGEX ".*_benchmark.cc")
 add_executable(${PROJECT_NAME}_test ${test_source_list})
 target_include_directories(
@@ -62,3 +64,30 @@ gtest_discover_tests(
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
 include(CPack)
+
+set(paper_join_common_sources
+    paper_join/paper_join_dpu.cc
+    generator/generator.cc
+    generator/random.cc
+    partition/partition.cc
+    partition/partitioner.cc
+    dpuext/arrow_utils.cc)
+
+add_executable(paper_join ${paper_join_common_sources} paper_join/main.cc)
+target_include_directories(
+  paper_join
+  PUBLIC "${DPU_HOST_INCLUDE_DIRECTORIES}"
+  PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+target_include_directories(paper_join SYSTEM PUBLIC "${ARROW_INCLUDE_DIR}")
+target_compile_definitions(paper_join PUBLIC NR_DPUS=${NR_DPUS})
+target_link_libraries(paper_join PUBLIC ${DPU_HOST_LIBRARIES} PRIVATE arrow_shared)
+
+add_executable(paper_join_bench ${paper_join_common_sources} paper_join/paper_join_benchmark.cc)
+target_include_directories(
+  paper_join_bench
+  PUBLIC "${DPU_HOST_INCLUDE_DIRECTORIES}"
+  PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+target_include_directories(paper_join_bench SYSTEM PUBLIC "${ARROW_INCLUDE_DIR}")
+target_compile_definitions(paper_join_bench PUBLIC NR_DPUS=${NR_DPUS})
+target_link_libraries(paper_join_bench PUBLIC ${DPU_HOST_LIBRARIES}
+                      PRIVATE arrow_shared benchmark benchmark_main)

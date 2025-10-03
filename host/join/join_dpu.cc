@@ -12,8 +12,12 @@
 #include "umq/log.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <unordered_set>
+
+#include <arrow/compute/api.h>
+#include <arrow/scalar.h>
 
 using namespace dpu;
 
@@ -261,10 +265,10 @@ arrow::Result<std::shared_ptr<partition::Partitioner>> JoinDpu::do_partition(
   auto nr_dpus = system_.dpus().size();
   auto batch_rows = batches[0]->num_rows();
 
+  const double padding = is_left ? 2.0 : 1.5;
+  int64_t partition_capacity = static_cast<int64_t>(std::ceil(batch_rows * padding));
   TIME_AND_CHECK("partitionAllocation",
-                 partitioner->AllocatePartitions(n_partitions,
-                                                  // TODO: check if overkill
-                                                 batch_rows * 1.5));
+                 partitioner->AllocatePartitions(n_partitions, partition_capacity));
 
   // allocate offset vectors for each partition, used by all threads
   // only used for left table
@@ -424,6 +428,7 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
   std::vector<int32_t> kernel_param_probe{KernelHashProbe};
   std::vector<int32_t> kernel_param_take{KernelTake};
   std::vector<arrow::RecordBatchVector> new_batches(system_.ranks().size());
+  std::vector<std::vector<std::shared_ptr<arrow::Array>>> selection_vectors(system_.ranks().size());
 
   for (size_t batches_offset = 0; batches_offset < n_partitions; batches_offset += nr_dpus) {
     /* Hash Build Phase */
@@ -472,22 +477,21 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
                                              batches_offset, fk_column_index, true));
       // Execute DPU program asynchronously
       system_.async().exec();
+      system_.async().sync();
 
-      system_.async().call([this](DpuSet& set, unsigned __attribute__((unused)) rank_id) -> void {
-        std::vector<std::vector<uint32_t>> bloom_counts(set.dpus().size());
-        for (auto& counts : bloom_counts) {
-          counts.resize(1);
-        }
-        set.copy(bloom_counts, "bloom_skipped");
-        uint64_t local = 0;
-        for (const auto& counts : bloom_counts) {
-          local += counts[0];
-        }
-        if (local > 0) {
-          std::lock_guard<std::mutex> lock(bloom_mutex_);
-          bloom_skipped_total_ += local;
-        }
-      });
+      std::vector<std::vector<uint32_t>> bloom_counts(system_.dpus().size());
+      for (auto& counts : bloom_counts) {
+        counts.resize(1);
+      }
+      system_.copy(bloom_counts, "bloom_skipped");
+      uint64_t local = 0;
+      for (const auto& counts : bloom_counts) {
+        local += counts[0];
+      }
+      if (local > 0) {
+        std::lock_guard<std::mutex> lock(bloom_mutex_);
+        bloom_skipped_total_ += local;
+      }
 
       stop_async_timer("probe");
 
@@ -560,6 +564,21 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
 
       return arrow::Status::OK();
     }()));
+
+    system_.async().call([this, &dpu_offset, &selection_vectors,
+                          &buffer_partitioned_length_param_left, batches_offset](DpuSet& set,
+                                                                           unsigned rank_id) -> void {
+      auto selections =
+          arrow_copy_from_dpus(set, "selection_indices_vector", arrow::uint32(),
+                               buffer_partitioned_length_param_left.begin() +
+                                   dpu_offset[rank_id] + batches_offset)
+              .ValueOrDie();
+      auto& storage = selection_vectors[rank_id];
+      storage.reserve(storage.size() + selections.size());
+      for (auto& selection : selections) {
+        storage.push_back(std::move(selection));
+      }
+    });
   }
 
   arrow::RecordBatchVector record_batches;
@@ -569,15 +588,38 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
 
   /* Build record batches */
   ARROW_RETURN_NOT_OK(([this, &new_batches, &record_batches,
-                        n_partitions] {
+                        n_partitions, &selection_vectors] {
     uint32_t c_partitions = 0, c_iter = 0;
 
     while (c_partitions < n_partitions) {
       uint32_t rank_id = 0;
       for (auto const& rank : system_.ranks()) {
         for (size_t d = 0; d < rank->dpus().size(); ++d) {
-          record_batches.push_back(
-              std::move(new_batches[rank_id][c_iter * rank->dpus().size() + d]));
+          auto index = c_iter * rank->dpus().size() + d;
+          auto batch = std::move(new_batches[rank_id][index]);
+          auto selection_array = std::static_pointer_cast<arrow::UInt32Array>(
+              selection_vectors[rank_id][index]);
+
+          auto mismatch_scalar = std::make_shared<arrow::UInt32Scalar>(UINT32_MAX);
+          std::vector<arrow::Datum> mask_args = {arrow::Datum(selection_array),
+                                                 arrow::Datum(mismatch_scalar)};
+          ARROW_ASSIGN_OR_RAISE(auto mask_datum,
+                                arrow::compute::CallFunction("not_equal", mask_args));
+
+          arrow::ArrayVector filtered_columns;
+          filtered_columns.reserve(batch->num_columns());
+          arrow::compute::FilterOptions filter_options;
+          for (int column_index = 0; column_index < batch->num_columns(); ++column_index) {
+            ARROW_ASSIGN_OR_RAISE(auto filtered_datum,
+                                  arrow::compute::Filter(arrow::Datum(batch->column(column_index)),
+                                                         mask_datum, filter_options));
+            filtered_columns.push_back(filtered_datum.make_array());
+          }
+
+          int64_t filtered_length = filtered_columns.empty() ? 0 : filtered_columns[0]->length();
+          record_batches.push_back(arrow::RecordBatch::Make(batch->schema(), filtered_length,
+                                                           std::move(filtered_columns)));
+          selection_vectors[rank_id][index].reset();
           ++c_partitions;
         }
         rank_id++;
