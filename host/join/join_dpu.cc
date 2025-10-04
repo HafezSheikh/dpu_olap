@@ -5,10 +5,19 @@
 
 #include "dpuext/api.h"
 #include "generator/generator.h"
+#include "system/system.h"
 
 #include "umq/bitops.h"
 #include "umq/kernels.h"
 #include "umq/log.h"
+
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <unordered_set>
+
+#include <arrow/compute/api.h>
+#include <arrow/scalar.h>
 
 using namespace dpu;
 
@@ -79,6 +88,168 @@ static inline auto get_buffer_lengths(int key_column_index,
   return buffer_lengths;
 }
 
+namespace {
+
+struct BloomConfig {
+  uint32_t bits_per_key;
+  uint32_t min_bits;
+  uint32_t max_bits;
+  uint32_t min_partition_rows;
+  uint32_t max_partition_rows;
+  double min_mismatch_rate;
+};
+
+static inline BloomConfig GetBloomConfig() {
+  BloomConfig cfg{};
+  cfg.bits_per_key = static_cast<uint32_t>(std::max(1, variables::bloom_bits_per_key()));
+  cfg.min_bits = static_cast<uint32_t>(std::max(1, variables::bloom_min_bits()));
+  const uint32_t configured_max_bits =
+      static_cast<uint32_t>(std::max(1, variables::bloom_max_bits()));
+  cfg.max_bits = std::max<uint32_t>(cfg.min_bits, configured_max_bits);
+  cfg.min_partition_rows =
+      static_cast<uint32_t>(std::max(0, variables::bloom_min_partition_rows()));
+  const uint32_t configured_max_partition_rows =
+      static_cast<uint32_t>(std::max(0, variables::bloom_max_partition_rows()));
+  cfg.max_partition_rows =
+      std::max<uint32_t>(cfg.min_partition_rows, configured_max_partition_rows);
+  cfg.min_mismatch_rate = std::clamp(variables::bloom_min_mismatch_rate(), 0.0, 1.0);
+  return cfg;
+}
+
+constexpr size_t kMaxRightSample = 4096u;
+constexpr size_t kMaxLeftSample = 4096u;
+
+template <typename ArrowType>
+double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
+                                 const arrow::NumericArray<ArrowType>& right) {
+  using CType = typename ArrowType::c_type;
+
+  const int64_t right_length = right.length();
+  if (right_length == 0) {
+    return 0.0;
+  }
+
+  size_t right_sample_target = static_cast<size_t>(std::min<int64_t>(kMaxRightSample, right_length));
+  int64_t right_step = std::max<int64_t>(1, right_length / static_cast<int64_t>(right_sample_target));
+
+  std::unordered_set<CType> right_sample;
+  right_sample.reserve(right_sample_target);
+  const CType* right_values = right.raw_values();
+
+  for (int64_t idx = 0; idx < right_length && right_sample.size() < right_sample_target; idx += right_step) {
+    if (!right.IsNull(idx)) {
+      right_sample.insert(right_values[idx]);
+    }
+  }
+
+  if (right_sample.empty()) {
+    return 1.0;  // treat as no coverage → bloom not useful
+  }
+
+  const int64_t left_length = left.length();
+  if (left_length == 0) {
+    return 0.0;
+  }
+  size_t left_sample_target = static_cast<size_t>(std::min<int64_t>(kMaxLeftSample, left_length));
+  int64_t left_step = std::max<int64_t>(1, left_length / static_cast<int64_t>(left_sample_target));
+
+  const CType* left_values = left.raw_values();
+  size_t considered = 0;
+  size_t misses = 0;
+  for (int64_t idx = 0; idx < left_length && considered < left_sample_target; idx += left_step) {
+    if (left.IsNull(idx)) {
+      continue;
+    }
+    const CType value = left_values[idx];
+    if (right_sample.find(value) == right_sample.end()) {
+      ++misses;
+    }
+    ++considered;
+  }
+
+  if (considered == 0) {
+    return 0.0;
+  }
+
+  return static_cast<double>(misses) / static_cast<double>(considered);
+}
+
+double EstimateMismatchRate(const std::shared_ptr<arrow::Array>& left,
+                            const std::shared_ptr<arrow::Array>& right) {
+  if (left->type_id() != right->type_id()) {
+    return 1.0;
+  }
+  switch (left->type_id()) {
+    case arrow::Type::UINT32:
+      return EstimateMismatchRateTyped<arrow::UInt32Type>(
+          static_cast<const arrow::UInt32Array&>(*left),
+          static_cast<const arrow::UInt32Array&>(*right));
+    case arrow::Type::INT32:
+      return EstimateMismatchRateTyped<arrow::Int32Type>(
+          static_cast<const arrow::Int32Array&>(*left),
+          static_cast<const arrow::Int32Array&>(*right));
+    default:
+      return 1.0;  // unknown type → assume many mismatches to keep conservative behaviour
+  }
+}
+
+std::vector<std::vector<uint32_t>> ComputeBloomBitAllocation(
+    const arrow::RecordBatchVector& left_partitions,
+    const arrow::RecordBatchVector& right_partitions,
+    int fk_column_index, int pk_column_index,
+    const std::vector<std::vector<uint32_t>>& right_lengths) {
+  const BloomConfig cfg = GetBloomConfig();
+  std::cout << "[Bloom] config bits_per_key=" << cfg.bits_per_key
+            << " min_bits=" << cfg.min_bits << " max_bits=" << cfg.max_bits
+            << " min_partition_rows=" << cfg.min_partition_rows
+            << " max_partition_rows=" << cfg.max_partition_rows
+            << " min_mismatch_rate=" << cfg.min_mismatch_rate << std::endl;
+
+  std::vector<std::vector<uint32_t>> bloom_bits(
+      right_lengths.size(), std::vector<uint32_t>(1, 0));
+
+  for (size_t i = 0; i < right_lengths.size(); ++i) {
+    const uint32_t right_length = right_lengths[i].empty() ? 0 : right_lengths[i][0];
+    if (right_length < cfg.min_partition_rows) {
+      std::cout << "[Bloom] partition " << i << " skipped (right_length=" << right_length
+                << " < " << cfg.min_partition_rows << ")" << std::endl;
+      continue;  // partitions too small to amortize bloom setup
+    }
+
+    if (cfg.max_partition_rows > 0 && right_length > cfg.max_partition_rows) {
+      std::cout << "[Bloom] partition " << i << " skipped (right_length=" << right_length
+                << " > " << cfg.max_partition_rows << ")" << std::endl;
+      continue;
+    }
+
+    const auto& right_column = right_partitions[i]->column(pk_column_index);
+    const auto& left_column = left_partitions[i]->column(fk_column_index);
+
+    const double mismatch_rate = EstimateMismatchRate(left_column, right_column);
+    if (mismatch_rate < cfg.min_mismatch_rate) {
+      std::cout << std::fixed << std::setprecision(3)
+                << "[Bloom] partition " << i << " skipped (mismatch_rate=" << mismatch_rate
+                << " < " << cfg.min_mismatch_rate << ") right_length=" << right_length
+                << std::endl;
+      continue;  // too few misses expected → bloom would hurt
+    }
+
+    uint64_t bits = static_cast<uint64_t>(right_length) * cfg.bits_per_key;
+    bits = std::max<uint64_t>(bits, cfg.min_bits);
+    bits = std::min<uint64_t>(bits, cfg.max_bits);
+    bloom_bits[i][0] = static_cast<uint32_t>(bits);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "[Bloom] partition " << i << " enabled (mismatch_rate=" << mismatch_rate
+              << ", right_length=" << right_length << ", bloom_bits=" << bloom_bits[i][0]
+              << ")" << std::endl;
+  }
+
+  return bloom_bits;
+}
+
+}  // namespace
+
 arrow::Result<std::shared_ptr<partition::Partitioner>> JoinDpu::do_partition(
     int k_column_index,
     const std::vector<uint32_t>& dpu_offset, std::vector<std::vector<uint32_t>>& metadata,
@@ -94,10 +265,10 @@ arrow::Result<std::shared_ptr<partition::Partitioner>> JoinDpu::do_partition(
   auto nr_dpus = system_.dpus().size();
   auto batch_rows = batches[0]->num_rows();
 
+  const double padding = is_left ? 2.0 : 1.5;
+  int64_t partition_capacity = static_cast<int64_t>(std::ceil(batch_rows * padding));
   TIME_AND_CHECK("partitionAllocation",
-                 partitioner->AllocatePartitions(n_partitions,
-                                                  // TODO: check if overkill
-                                                 batch_rows * 1.5));
+                 partitioner->AllocatePartitions(n_partitions, partition_capacity));
 
   // allocate offset vectors for each partition, used by all threads
   // only used for left table
@@ -156,7 +327,10 @@ arrow::Status JoinDpu::Prepare() {
 }
 
 arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run() {
-
+  {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    bloom_skipped_total_ = 0;
+  }
   start_async_timer("outer");
   auto result = Run_internal();
   stop_async_timer("outer");
@@ -245,11 +419,16 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
   auto buffer_partitioned_length_param_left =
       get_buffer_lengths(fk_column_index, left_partitions_);
 
+  auto bloom_bits_per_partition = ComputeBloomBitAllocation(
+      left_partitions_, right_partitions_, fk_column_index, pk_column_index,
+      buffer_partitioned_length_param_right);
+
   // Declare persistent variables
   std::vector<int32_t> kernel_param_build{KernelHashBuild};
   std::vector<int32_t> kernel_param_probe{KernelHashProbe};
   std::vector<int32_t> kernel_param_take{KernelTake};
   std::vector<arrow::RecordBatchVector> new_batches(system_.ranks().size());
+  std::vector<std::vector<std::shared_ptr<arrow::Array>>> selection_vectors(system_.ranks().size());
 
   for (size_t batches_offset = 0; batches_offset < n_partitions; batches_offset += nr_dpus) {
     /* Hash Build Phase */
@@ -257,7 +436,9 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
                           &buffer_partitioned_length_param_right =
                               as_const(buffer_partitioned_length_param_right),
                           &right_partitions = as_const(right_partitions_), batches_offset,
-                          pk_column_index] {
+                          pk_column_index,
+                          &bloom_bits_per_partition =
+                              as_const(bloom_bits_per_partition)] {
       start_async_timer("build");
 
       // Set kernel to hash build
@@ -265,6 +446,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
       // Copy buffer length
       system_.async().copy_from("buffer_length", buffer_partitioned_length_param_right,
                                 batches_offset);
+      system_.async().copy_from("bloom_n_bits", bloom_bits_per_partition, batches_offset);
+
       // Copy input data buffers (primary key column of right batches)
       ARROW_RETURN_NOT_OK(arrow_copy_to_dpus(system_, "buffer", right_partitions,
                                              batches_offset, pk_column_index, true));
@@ -294,6 +477,21 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
                                              batches_offset, fk_column_index, true));
       // Execute DPU program asynchronously
       system_.async().exec();
+      system_.async().sync();
+
+      std::vector<std::vector<uint32_t>> bloom_counts(system_.dpus().size());
+      for (auto& counts : bloom_counts) {
+        counts.resize(1);
+      }
+      system_.copy(bloom_counts, "bloom_skipped");
+      uint64_t local = 0;
+      for (const auto& counts : bloom_counts) {
+        local += counts[0];
+      }
+      if (local > 0) {
+        std::lock_guard<std::mutex> lock(bloom_mutex_);
+        bloom_skipped_total_ += local;
+      }
 
       stop_async_timer("probe");
 
@@ -366,6 +564,21 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
 
       return arrow::Status::OK();
     }()));
+
+    system_.async().call([this, &dpu_offset, &selection_vectors,
+                          &buffer_partitioned_length_param_left, batches_offset](DpuSet& set,
+                                                                           unsigned rank_id) -> void {
+      auto selections =
+          arrow_copy_from_dpus(set, "selection_indices_vector", arrow::uint32(),
+                               buffer_partitioned_length_param_left.begin() +
+                                   dpu_offset[rank_id] + batches_offset)
+              .ValueOrDie();
+      auto& storage = selection_vectors[rank_id];
+      storage.reserve(storage.size() + selections.size());
+      for (auto& selection : selections) {
+        storage.push_back(std::move(selection));
+      }
+    });
   }
 
   arrow::RecordBatchVector record_batches;
@@ -375,15 +588,38 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
 
   /* Build record batches */
   ARROW_RETURN_NOT_OK(([this, &new_batches, &record_batches,
-                        n_partitions] {
+                        n_partitions, &selection_vectors] {
     uint32_t c_partitions = 0, c_iter = 0;
 
     while (c_partitions < n_partitions) {
       uint32_t rank_id = 0;
       for (auto const& rank : system_.ranks()) {
         for (size_t d = 0; d < rank->dpus().size(); ++d) {
-          record_batches.push_back(
-              std::move(new_batches[rank_id][c_iter * rank->dpus().size() + d]));
+          auto index = c_iter * rank->dpus().size() + d;
+          auto batch = std::move(new_batches[rank_id][index]);
+          auto selection_array = std::static_pointer_cast<arrow::UInt32Array>(
+              selection_vectors[rank_id][index]);
+
+          auto mismatch_scalar = std::make_shared<arrow::UInt32Scalar>(UINT32_MAX);
+          std::vector<arrow::Datum> mask_args = {arrow::Datum(selection_array),
+                                                 arrow::Datum(mismatch_scalar)};
+          ARROW_ASSIGN_OR_RAISE(auto mask_datum,
+                                arrow::compute::CallFunction("not_equal", mask_args));
+
+          arrow::ArrayVector filtered_columns;
+          filtered_columns.reserve(batch->num_columns());
+          arrow::compute::FilterOptions filter_options;
+          for (int column_index = 0; column_index < batch->num_columns(); ++column_index) {
+            ARROW_ASSIGN_OR_RAISE(auto filtered_datum,
+                                  arrow::compute::Filter(arrow::Datum(batch->column(column_index)),
+                                                         mask_datum, filter_options));
+            filtered_columns.push_back(filtered_datum.make_array());
+          }
+
+          int64_t filtered_length = filtered_columns.empty() ? 0 : filtered_columns[0]->length();
+          record_batches.push_back(arrow::RecordBatch::Make(batch->schema(), filtered_length,
+                                                           std::move(filtered_columns)));
+          selection_vectors[rank_id][index].reset();
           ++c_partitions;
         }
         rank_id++;

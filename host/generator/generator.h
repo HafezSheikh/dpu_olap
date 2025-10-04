@@ -24,7 +24,8 @@ arrow::RecordBatchVector AddColumn(const std::string& name,
 
 arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
     ::arrow::random::RandomArrayGenerator& g, uint32_t pk_batch_size, int32_t num_batches,
-    int32_t batch_size);
+    int32_t batch_size, double outside_ratio,
+    std::pair<uint64_t, uint64_t>* counts = nullptr);
 
 std::vector<arrow::compute::ExecBatch> ToExecBatches(arrow::RecordBatchVector batches);
 

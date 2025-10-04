@@ -31,8 +31,12 @@ int kernel_take(uint32_t tasklet_id, __mram_ptr T* buffer, __mram_ptr T* output_
     if(selection_indices_vector_length >= block_offset && (selection_indices_vector_length - block_offset) < max)
       max = selection_indices_vector_length - block_offset;
     for (unsigned int i = 0; i < max; ++i) {
-    /*for (size_t i = 0; i < BLOCK_LENGTH && block_offset + i < selection_indices_vector_length; ++i) {*/
       uint32_t index = indices_cache[i];
+      if (index == UINT32_MAX) {
+        // Leave a neutral value in the output; host filters the row later.
+        output_cache[i] = 0;
+        continue;
+      }
       // TODO: Add bound check for 0 <= index <= length of buffer?
       T item = mram_load(item, ra_cache, &buffer[index]);
       output_cache[i] = item;

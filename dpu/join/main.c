@@ -14,13 +14,16 @@
 #include "kernels/hash_probe.h"
 #include "kernels/take.h"
 
+#include "kernels/bloom.h"
+#include "kernels/common.h"
+ // include this header
 #include <stdio.h>
 
 #if ENABLE_PERF
 #include <perfcounter.h>
 #endif
 
-#define BUFFER_LENGTH ((2 << 20) + (2 << 15))                // 2MiB items + 32KiB
+#define BUFFER_LENGTH ((1 << 20) + (2 << 15))                // 2MiB items + 32KiB
 #define BUFFER_SIZE_IN_BYTES (BUFFER_LENGTH << T_SIZE_LOG2)  // 8MiB
 // TODO: the input buffer is reused in the probing stage and can be larger at that stage
 // #define BUFFER_LENGTH (4 << 20)  // 4MiB items but only 2MiB usable in hash build stage
@@ -46,12 +49,23 @@ __host uint32_t selection_indices_vector_length = 0;
 __mram_noinit T output_buffer[BUFFER_LENGTH];
 __host uint32_t output_buffer_length = 0;
 
+
+// after existing __mram_noinit buffers
+// Bloom filter bit array for this DPU
+// We choose a compile-time max bits value or set it via host. For safety, allocate a decent sized array.
+// Example: allow up to MAX_BLOOM_BITS bits (e.g., 1<<20 bits = 1M bits = 128 KiB).
+// adjust as needed
+__mram_noinit uint8_t bloom_bits[MAX_BLOOM_BITS / 8];
+__host uint32_t bloom_n_bits = 0; // actual n_bits used (host will set)
+__host uint32_t bloom_skipped = 0;
+
 // Shared hash table
 hash_table_t hashtable;
 
 // Synchronization
 BARRIER_INIT(barrier, NR_TASKLETS);
 MUTEX_INIT(writer_mutex);
+MUTEX_INIT(bloom_mutex);
 
 // Outputs
 __host uint32_t nb_cycles = 0;
@@ -60,10 +74,30 @@ __host kernel_partition_outputs_t OUTPUT;
 // histogram for each partition
 __host uint32_t* histogram_wram = 0;
 
+
+
 void initialize_hash_table(uint32_t tasklet_id) {
   if (tasklet_id == 0) {
     mram_reset();
     ht_init(&hashtable, writer_mutex, HASHTABLE_CAPACITY);
+    // zero bloom bits (host may have set bloom_n_bits earlier)
+    if (bloom_n_bits > 0) {
+      uint32_t nbytes = (bloom_n_bits + 7) >> 3;
+      static __dma_aligned uint8_t zero_block[64] = {0};
+      uint32_t offset = 0;
+      while (offset < nbytes) {
+        uint32_t chunk = nbytes - offset;
+        if (chunk > sizeof(zero_block)) {
+          chunk = sizeof(zero_block);
+        }
+        uint32_t chunk_aligned = ROUND_UP_TO_MULTIPLE_OF_8(chunk);
+        mram_write(zero_block, &bloom_bits[offset], chunk_aligned);
+        offset += chunk;
+      }
+      trace("Bloom filter enabled: %u bits (%u bytes)\n", bloom_n_bits, nbytes);
+    } else {
+      trace("Bloom filter disabled for this partition\n");
+    }
     trace("Allocated hash table with capacity %d (%d bytes allocated)\n",
           HASHTABLE_CAPACITY, ht_allocated_bytes(&hashtable));
   }
@@ -75,7 +109,7 @@ int main() {
 
 #if ENABLE_PERF
   if (tasklet_id == 0) {
-    perfcounter_config(COUNT_CYCLES, true);
+    perfcounter_config(COUNT_INSTRUCTIONS, true);
   }
 #endif
   trace("Tasklet %d main: running kernel %d\n", tasklet_id, kernel);
@@ -107,7 +141,10 @@ int main() {
       break;
     case KernelHashBuild:
       initialize_hash_table(tasklet_id);
-      result = kernel_hash_build(tasklet_id, buffer, buffer_length, &hashtable);
+      result = kernel_hash_build(tasklet_id, buffer, buffer_length, &hashtable, bloom_n_bits, bloom_bits);
+      if (tasklet_id == 0) {
+        trace("Hash build completed: buffer_length=%u bloom_bits=%u\n", buffer_length, bloom_n_bits);
+      }
       // if(tasklet_id == 0) {
       //   printf("Input: ");
       //   for (int i = 0; i < 10; i++) {
@@ -126,8 +163,11 @@ int main() {
       break;
     case KernelHashProbe:
       result = kernel_hash_probe(tasklet_id, buffer, buffer_length, &hashtable,
-                                 selection_indices_vector);
+                                 selection_indices_vector, bloom_n_bits, bloom_bits );
       selection_indices_vector_length = buffer_length;
+      if (tasklet_id == 0) {
+        trace("Hash probe completed: buffer_length=%u bloom_bits=%u\n", buffer_length, bloom_n_bits);
+      }
       break;
     case KernelTake:
       result = kernel_take(tasklet_id, buffer, output_buffer, selection_indices_vector, buffer_length);

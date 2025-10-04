@@ -16,7 +16,7 @@
 #include <perfcounter.h>
 #endif
 
-#define BUFFER_LENGTH (4 << 20)                              // 4MiB items
+#define BUFFER_LENGTH (2 << 20)                              // 4MiB items
 #define BUFFER_SIZE_IN_BYTES (BUFFER_LENGTH << T_SIZE_LOG2)  // 16MiB
 
 // Inputs
@@ -39,7 +39,7 @@ int main() {
 
 #if ENABLE_PERF
   if (tasklet_id == 0) {
-    perfcounter_config(COUNT_CYCLES, true);
+    perfcounter_config(COUNT_INSTRUCTIONS, true);
   }
 #endif
   trace("Tasklet %d main: running kernel %d\n", tasklet_id, kernel);

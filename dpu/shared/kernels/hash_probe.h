@@ -23,4 +23,4 @@
  */
 int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer_length,
                       hash_table_t* hashtable,
-                      __mram_ptr uint32_t* selection_indices_vector);
+                      __mram_ptr uint32_t* selection_indices_vector, uint32_t bloom_n_bits, __mram_ptr uint8_t* bloom_bits);

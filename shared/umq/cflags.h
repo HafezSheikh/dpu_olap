@@ -14,7 +14,7 @@
 #endif
 
 #ifndef HT_ENABLE_STATS
-#define HT_ENABLE_STATS 0
+#define HT_ENABLE_STATS 1
 #endif
 
 #ifndef HT_ENABLE_MULTILOCK
