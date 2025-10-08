@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "dpuext/api.h"
 #include "generator/generator.h"
@@ -17,6 +18,7 @@ struct BenchmarkParams {
   int64_t batch_rows;
   double fk_outside_ratio;
   double bloom_threshold;
+  int64_t bloom_bits_per_key;
   int nr_dpus;
 };
 
@@ -26,7 +28,8 @@ BenchmarkParams ParseState(const benchmark::State& state) {
   params.batch_rows = state.range(1);
   params.fk_outside_ratio = static_cast<double>(state.range(2)) / 1000.0;
   params.bloom_threshold = static_cast<double>(state.range(3)) / 1000.0;
-  params.nr_dpus = static_cast<int>(state.range(4));
+  params.bloom_bits_per_key = state.range(4);
+  params.nr_dpus = static_cast<int>(state.range(5));
   return params;
 }
 
@@ -40,6 +43,8 @@ void BM_PaperJoin(benchmark::State& state) {
 
   setenv("BLOOM_MIN_MISMATCH_RATE",
          std::to_string(params.bloom_threshold).c_str(), 1);
+  setenv("BLOOM_BITS_PER_KEY",
+         std::to_string(params.bloom_bits_per_key).c_str(), 1);
 
   uint64_t total_sum = 0;
   uint64_t matches_sum = 0;
@@ -161,18 +166,22 @@ static void ApplyPaperJoinArgs(benchmark::internal::Benchmark* bench) {
   const std::array<int64_t, 1> batches_list = {2};
   const std::array<int64_t, 3> batch_rows_list = {65536, 131072, 262144};
   const std::array<int64_t, 4> fk_ratio_milli_list = {100, 300, 600, 900};
-  const std::array<int64_t, 2> bloom_thresh_milli_list = {0};
+  const std::array<int64_t, 1> bloom_thresh_milli_list = {0};
+  const std::array<int64_t, 3> bloom_bits_per_key_list = {3, 6, 9};
   const std::array<int64_t, 1> dpus_list = {2};
 
   for (auto batches : batches_list) {
     for (auto batch_rows : batch_rows_list) {
       for (auto fk_ratio : fk_ratio_milli_list) {
         for (auto bloom_thresh : bloom_thresh_milli_list) {
-          for (auto nr_dpus : dpus_list) {
-            if (batches % nr_dpus != 0) {
-              continue;
+          for (auto bloom_bits_per_key : bloom_bits_per_key_list) {
+            for (auto nr_dpus : dpus_list) {
+              if (batches % nr_dpus != 0) {
+                continue;
+              }
+              bench->Args({batches, batch_rows, fk_ratio, bloom_thresh,
+                           bloom_bits_per_key, nr_dpus});
             }
-            bench->Args({batches, batch_rows, fk_ratio, bloom_thresh, nr_dpus});
           }
         }
       }
@@ -180,23 +189,38 @@ static void ApplyPaperJoinArgs(benchmark::internal::Benchmark* bench) {
   }
 }
 
-static void RegisterPaperJoinBenchmarks() {
-  benchmark::RegisterBenchmark(
-      "BM_PaperJoin",
-      [](benchmark::State& state) { BM_PaperJoin(state); })
-      ->ArgNames({"batches", "batch_rows", "fk_ratio_milli",
-                  "bloom_thresh_milli", "nr_dpus"})
-      ->Apply(ApplyPaperJoinArgs)
-      ->UseRealTime()
-      ->Iterations(1)
-      ->Unit(benchmark::kMillisecond);
-}
-
-static const bool kBenchRegistered = []() {
-  RegisterPaperJoinBenchmarks();
-  return true;
-}();
+static auto* const kPaperJoinBenchmarkRegistration =
+    benchmark::RegisterBenchmark("BM_PaperJoin",
+                                 [](benchmark::State& state) { BM_PaperJoin(state); })
+        ->ArgNames({"batches", "batch_rows", "fk_ratio_milli",
+                    "bloom_thresh_milli", "bloom_bits_per_key", "nr_dpus"})
+        ->Apply(ApplyPaperJoinArgs)
+        ->UseRealTime()
+        ->Iterations(1)
+        ->Unit(benchmark::kMillisecond);
 
 }  // namespace
 
-BENCHMARK_MAIN();
+int main(int argc, char** argv) {
+  (void)kPaperJoinBenchmarkRegistration;
+  std::vector<std::string> forced_flags = {
+      "--benchmark_out=paper_join_benchmark_results.json",
+      "--benchmark_out_format=json"};
+  std::vector<char*> argv_extended;
+  argv_extended.reserve(argc + forced_flags.size());
+  for (int i = 0; i < argc; ++i) {
+    argv_extended.push_back(argv[i]);
+  }
+  for (auto& flag : forced_flags) {
+    argv_extended.push_back(const_cast<char*>(flag.c_str()));
+  }
+  int argc_extended = static_cast<int>(argv_extended.size());
+  benchmark::Initialize(&argc_extended, argv_extended.data());
+  if (::benchmark::ReportUnrecognizedArguments(argc_extended, argv_extended.data())) {
+    return 1;
+  }
+
+  benchmark::RunSpecifiedBenchmarks();
+  benchmark::Shutdown();
+  return 0;
+}
