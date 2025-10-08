@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <random>
+#include <limits>
 
 namespace upmemeval {
 
@@ -58,6 +59,11 @@ arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
   uint64_t total_inside = 0;
   uint64_t total_outside = 0;
 
+  const uint64_t global_span = static_cast<uint64_t>(num_batches) * pk_batch_size;
+  const bool use_high_bit_escape = global_span < (1ull << 31);
+  std::uniform_int_distribution<uint32_t> outside_dist_global(
+      0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
+
   for (int32_t batch = 0; batch < num_batches; ++batch) {
     arrow::UInt32Builder builder;
     ARROW_RETURN_NOT_OK(builder.Reserve(batch_size));
@@ -73,7 +79,15 @@ arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
         value = pk_base + inside_dist(rng);
         ++total_inside;
       } else {
-        value = pk_base + pk_batch_size + outside_dist(rng);
+        if (use_high_bit_escape) {
+          value = (1u << 31) | outside_dist_global(rng);
+        } else {
+          uint64_t candidate = global_span + outside_dist_global(rng);
+          if (candidate > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            candidate = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+          }
+          value = static_cast<uint32_t>(candidate);
+        }
         ++total_outside;
       }
       builder.UnsafeAppend(value);

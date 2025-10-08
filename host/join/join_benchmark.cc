@@ -246,8 +246,8 @@ std::vector<JoinBenchmarkConfig> BuildJoinDpuBenchmarkConfigs() {
   const int64_t max_dpus = hardware_limit;
 const std::array<int64_t, 5> dpus_values = {4, 8, 16, 32, 64};
 const std::array<int64_t, 1> scale_multipliers = {1};
-const std::array<int64_t, 3> batch_rows = {64LL << 10, 128LL << 10, 256LL << 10};
-const std::array<double, 3> bloom_thresholds = {0.90, 0.94, 1.10};
+const std::array<int64_t, 3> batch_rows = {128LL << 10, 256LL << 10, 512LL << 10};
+const std::array<double, 3> bloom_thresholds = {0.0, 0.299, 1};
 
   for (int64_t dpus : dpus_values) {
     int64_t normalized_dpus = NormalizeDpuCount(dpus, max_dpus);
@@ -556,7 +556,7 @@ BENCHMARK_DEFINE_F(PartitionedBatchGeneratorFixture, BM_JoinDpu)
 #endif
 }
 
-constexpr std::array<double, 3> kNativeBloomThresholds = {0.90, 0.94, 1.10};
+constexpr std::array<double, 3> kNativeBloomThresholds = {0, 0.5, 1};
 
 void RegisterJoinNativeArgs(benchmark::internal::Benchmark* bench) {
   for (double threshold : kNativeBloomThresholds) {

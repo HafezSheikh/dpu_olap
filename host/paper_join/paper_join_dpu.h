@@ -1,7 +1,6 @@
 #pragma once
 
 #include <arrow/api.h>
-#include <mutex>
 #include <utility>
 
 #include "partition/partitioner.h"
@@ -13,9 +12,11 @@ namespace upmemeval {
 namespace paper_join {
 
 struct PaperJoinResult {
+  uint64_t total_probes;
   uint64_t matches;
   uint64_t mismatches;
   uint64_t bloom_skipped;
+  uint64_t bloom_false_positives;
 };
 
 class PaperJoinDpu {
@@ -40,9 +41,6 @@ class PaperJoinDpu {
   std::shared_ptr<arrow::Schema> right_schema_;
   arrow::RecordBatchVector left_batches_;
   arrow::RecordBatchVector right_batches_;
-
-  uint64_t bloom_skipped_total_ = 0;
-  mutable std::mutex bloom_mutex_;
 
   arrow::Result<std::shared_ptr<partition::Partitioner>> do_partition(
       int k_column_index,

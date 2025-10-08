@@ -13,6 +13,7 @@
 #include "kernels/hash_build.h"
 #include "kernels/hash_probe.h"
 #include "kernels/take.h"
+#include "kernels/bloom_profile.h"
 
 #include "kernels/bloom.h"
 #include "kernels/common.h"
@@ -23,7 +24,7 @@
 #include <perfcounter.h>
 #endif
 
-#define BUFFER_LENGTH ((1 << 20) + (2 << 15))                // 2MiB items + 32KiB
+#define BUFFER_LENGTH ((2 << 20) + (2 << 15))                // 2MiB items + 32KiB
 #define BUFFER_SIZE_IN_BYTES (BUFFER_LENGTH << T_SIZE_LOG2)  // 8MiB
 // TODO: the input buffer is reused in the probing stage and can be larger at that stage
 // #define BUFFER_LENGTH (4 << 20)  // 4MiB items but only 2MiB usable in hash build stage
@@ -58,6 +59,7 @@ __host uint32_t output_buffer_length = 0;
 __mram_noinit uint8_t bloom_bits[MAX_BLOOM_BITS / 8];
 __host uint32_t bloom_n_bits = 0; // actual n_bits used (host will set)
 __host uint32_t bloom_skipped = 0;
+__host bloom_profile_counters_t bloom_profile_counters;
 
 // Shared hash table
 hash_table_t hashtable;
@@ -167,6 +169,15 @@ int main() {
       selection_indices_vector_length = buffer_length;
       if (tasklet_id == 0) {
         trace("Hash probe completed: buffer_length=%u bloom_bits=%u\n", buffer_length, bloom_n_bits);
+      }
+      break;
+    case KernelBloomProfile:
+      result = kernel_bloom_profile(tasklet_id, buffer, buffer_length, &hashtable,
+                                    bloom_n_bits, bloom_bits, &bloom_profile_counters);
+      if (tasklet_id == 0) {
+        trace("Bloom profile completed: probes=%u skipped=%u matches=%u false_pos=%u\n",
+              bloom_profile_counters.total_probes, bloom_profile_counters.bloom_skipped,
+              bloom_profile_counters.matches, bloom_profile_counters.bloom_false_positives);
       }
       break;
     case KernelTake:

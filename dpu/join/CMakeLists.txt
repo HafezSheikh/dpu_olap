@@ -20,6 +20,7 @@ set(DPU_JOIN_SOURCES
     ${PROJECT_DPU_SOURCE_DIR}/shared/kernels/partition.c
     ${PROJECT_DPU_SOURCE_DIR}/shared/kernels/hash_build.c
     ${PROJECT_DPU_SOURCE_DIR}/shared/kernels/hash_probe.c
+    ${PROJECT_DPU_SOURCE_DIR}/shared/kernels/bloom_profile.c
     ${PROJECT_DPU_SOURCE_DIR}/shared/kernels/take.c
     ${PROJECT_DPU_SOURCE_DIR}/shared/mram_alloc.c
     ${PROJECT_DPU_SOURCE_DIR}/shared/hashtable/hashtable.c)

@@ -184,6 +184,9 @@ bool ht_get(hash_table_t* table, ht_key_t key, ht_value_t* value) {
         *value = entry.value;
         return true;
       }
+    } else {
+      // No tombstones exist in this table; the first empty slot means the key is absent.
+      return false;
     }
     i = (i + 1U) & mask;
   } while (i != last);

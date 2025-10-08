@@ -108,7 +108,9 @@ int main(int argc, char** argv) {
   }
 
   auto metrics = result.ValueOrDie();
-  std::cout << "Matches=" << metrics.matches << " mismatches=" << metrics.mismatches
-            << " bloom_skipped=" << metrics.bloom_skipped << std::endl;
+  std::cout << "Total=" << metrics.total_probes << " matches=" << metrics.matches
+            << " mismatches=" << metrics.mismatches
+            << " bloom_skipped=" << metrics.bloom_skipped
+            << " bloom_false_positive=" << metrics.bloom_false_positives << std::endl;
   return 0;
 }

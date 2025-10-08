@@ -116,9 +116,6 @@ static inline BloomConfig GetBloomConfig() {
   return cfg;
 }
 
-constexpr size_t kMaxRightSample = 4096u;
-constexpr size_t kMaxLeftSample = 4096u;
-
 template <typename ArrowType>
 double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
                                  const arrow::NumericArray<ArrowType>& right) {
@@ -129,48 +126,38 @@ double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
     return 0.0;
   }
 
-  size_t right_sample_target = static_cast<size_t>(std::min<int64_t>(kMaxRightSample, right_length));
-  int64_t right_step = std::max<int64_t>(1, right_length / static_cast<int64_t>(right_sample_target));
-
-  std::unordered_set<CType> right_sample;
-  right_sample.reserve(right_sample_target);
   const CType* right_values = right.raw_values();
-
-  for (int64_t idx = 0; idx < right_length && right_sample.size() < right_sample_target; idx += right_step) {
+  std::unordered_set<CType> right_lookup;
+  right_lookup.reserve(static_cast<size_t>(right_length));
+  for (int64_t idx = 0; idx < right_length; ++idx) {
     if (!right.IsNull(idx)) {
-      right_sample.insert(right_values[idx]);
+      right_lookup.insert(right_values[idx]);
     }
   }
-
-  if (right_sample.empty()) {
-    return 1.0;  // treat as no coverage → bloom not useful
+  if (right_lookup.empty()) {
+    return 1.0;
   }
 
   const int64_t left_length = left.length();
   if (left_length == 0) {
     return 0.0;
   }
-  size_t left_sample_target = static_cast<size_t>(std::min<int64_t>(kMaxLeftSample, left_length));
-  int64_t left_step = std::max<int64_t>(1, left_length / static_cast<int64_t>(left_sample_target));
-
   const CType* left_values = left.raw_values();
-  size_t considered = 0;
   size_t misses = 0;
-  for (int64_t idx = 0; idx < left_length && considered < left_sample_target; idx += left_step) {
+  size_t considered = 0;
+  for (int64_t idx = 0; idx < left_length; ++idx) {
     if (left.IsNull(idx)) {
       continue;
     }
-    const CType value = left_values[idx];
-    if (right_sample.find(value) == right_sample.end()) {
+    ++considered;
+    if (right_lookup.find(left_values[idx]) == right_lookup.end()) {
       ++misses;
     }
-    ++considered;
   }
 
   if (considered == 0) {
     return 0.0;
   }
-
   return static_cast<double>(misses) / static_cast<double>(considered);
 }
 

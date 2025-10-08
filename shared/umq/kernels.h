@@ -15,6 +15,7 @@ enum Kernel {
   KernelTake,
   KernelHashBuild,
   KernelHashProbe,
+  KernelBloomProfile,
   KernelPartition,
   KernelAggregate,
 };
@@ -49,5 +50,12 @@ typedef struct {
 typedef struct {
   uint64_t sum_result;
 } dpu_aggr_output __attribute__((aligned(8)));
+
+typedef struct {
+  uint32_t total_probes;
+  uint32_t bloom_skipped;
+  uint32_t bloom_false_positives;
+  uint32_t matches;
+} bloom_profile_counters_t __attribute__((aligned(8)));
 
 #endif

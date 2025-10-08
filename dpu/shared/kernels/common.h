@@ -8,4 +8,4 @@
 #define BLOCK_SIZE_IN_BYTES (BLOCK_LENGTH << T_SIZE_LOG2)
 
 // Bloom filter globals
-#define MAX_BLOOM_BITS (1 << 20)
+#define MAX_BLOOM_BITS (16 << 20)

@@ -1,18 +1,16 @@
 #include <benchmark/benchmark.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string>
-#include <mutex>
 
 #include "dpuext/api.h"
 #include "generator/generator.h"
 #include "paper_join_dpu.h"
 
 namespace {
-
-std::once_flag g_context_flag;
 
 struct BenchmarkParams {
   int64_t batches;
@@ -40,17 +38,14 @@ void BM_PaperJoin(benchmark::State& state) {
     return;
   }
 
-  std::call_once(g_context_flag, [&] {
-    benchmark::AddCustomContext("NR_DPUS", std::to_string(params.nr_dpus));
-    benchmark::AddCustomContext("SF", std::to_string(params.batches));
-  });
-
   setenv("BLOOM_MIN_MISMATCH_RATE",
          std::to_string(params.bloom_threshold).c_str(), 1);
 
+  uint64_t total_sum = 0;
   uint64_t matches_sum = 0;
   uint64_t mismatches_sum = 0;
   uint64_t bloom_sum = 0;
+  uint64_t bloom_fp_sum = 0;
   bool first_iteration = true;
 
   for (auto _ : state) {
@@ -116,28 +111,38 @@ void BM_PaperJoin(benchmark::State& state) {
 
     state.ResumeTiming();
 
-    auto status = join.Prepare();
-    if (!status.ok()) {
-      state.SkipWithError(status.ToString().c_str());
+    try {
+      auto status = join.Prepare();
+      if (!status.ok()) {
+        state.SkipWithError(status.ToString().c_str());
+        return;
+      }
+
+      auto result = join.Run();
+      if (!result.ok()) {
+        state.SkipWithError(result.status().ToString().c_str());
+        return;
+      }
+
+      auto metrics = result.ValueOrDie();
+      total_sum += metrics.total_probes;
+      matches_sum += metrics.matches;
+      mismatches_sum += metrics.mismatches;
+      bloom_sum += metrics.bloom_skipped;
+      bloom_fp_sum += metrics.bloom_false_positives;
+    } catch (const dpu::DpuError& e) {
+      state.SkipWithError(e.what());
       return;
     }
-
-    auto result = join.Run();
-    if (!result.ok()) {
-      state.SkipWithError(result.status().ToString().c_str());
-      return;
-    }
-
-    auto metrics = result.ValueOrDie();
-    matches_sum += metrics.matches;
-    mismatches_sum += metrics.mismatches;
-    bloom_sum += metrics.bloom_skipped;
   }
 
   uint64_t rows_per_iter = static_cast<uint64_t>(params.batches) *
                            static_cast<uint64_t>(params.batch_rows);
   state.SetItemsProcessed(rows_per_iter * state.iterations());
   state.SetBytesProcessed(state.items_processed() * sizeof(uint32_t));
+  state.counters["total_probes"] =
+      benchmark::Counter(static_cast<double>(total_sum),
+                         benchmark::Counter::kAvgIterations);
   state.counters["matches"] =
       benchmark::Counter(static_cast<double>(matches_sum),
                          benchmark::Counter::kAvgIterations);
@@ -147,6 +152,32 @@ void BM_PaperJoin(benchmark::State& state) {
   state.counters["bloom_skipped"] =
       benchmark::Counter(static_cast<double>(bloom_sum),
                          benchmark::Counter::kAvgIterations);
+  state.counters["bloom_false_positive"] =
+      benchmark::Counter(static_cast<double>(bloom_fp_sum),
+                         benchmark::Counter::kAvgIterations);
+}
+
+static void ApplyPaperJoinArgs(benchmark::internal::Benchmark* bench) {
+  const std::array<int64_t, 1> batches_list = {2};
+  const std::array<int64_t, 3> batch_rows_list = {65536, 131072, 262144};
+  const std::array<int64_t, 4> fk_ratio_milli_list = {100, 300, 600, 900};
+  const std::array<int64_t, 2> bloom_thresh_milli_list = {0};
+  const std::array<int64_t, 1> dpus_list = {2};
+
+  for (auto batches : batches_list) {
+    for (auto batch_rows : batch_rows_list) {
+      for (auto fk_ratio : fk_ratio_milli_list) {
+        for (auto bloom_thresh : bloom_thresh_milli_list) {
+          for (auto nr_dpus : dpus_list) {
+            if (batches % nr_dpus != 0) {
+              continue;
+            }
+            bench->Args({batches, batch_rows, fk_ratio, bloom_thresh, nr_dpus});
+          }
+        }
+      }
+    }
+  }
 }
 
 static void RegisterPaperJoinBenchmarks() {
@@ -155,8 +186,7 @@ static void RegisterPaperJoinBenchmarks() {
       [](benchmark::State& state) { BM_PaperJoin(state); })
       ->ArgNames({"batches", "batch_rows", "fk_ratio_milli",
                   "bloom_thresh_milli", "nr_dpus"})
-      ->Args({4, 4096, 500, 200, 4})
-      ->Args({4, 65536, 500, 200, 4})
+      ->Apply(ApplyPaperJoinArgs)
       ->UseRealTime()
       ->Iterations(1)
       ->Unit(benchmark::kMillisecond);

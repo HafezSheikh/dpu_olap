@@ -4,7 +4,6 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -73,9 +72,6 @@ BloomConfig GetBloomConfig() {
   return cfg;
 }
 
-constexpr size_t kMaxRightSample = 4096u;
-constexpr size_t kMaxLeftSample = 4096u;
-
 template <typename ArrowType>
 double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
                                  const arrow::NumericArray<ArrowType>& right) {
@@ -86,20 +82,16 @@ double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
     return 0.0;
   }
 
-  size_t right_target = static_cast<size_t>(std::min<int64_t>(kMaxRightSample, right_length));
-  int64_t right_step = std::max<int64_t>(1, right_length / static_cast<int64_t>(right_target));
-
-  std::unordered_set<CType> right_values;
-  right_values.reserve(right_target);
   const CType* right_raw = right.raw_values();
-  for (int64_t idx = 0; idx < right_length && right_values.size() < right_target; idx += right_step) {
+  std::unordered_set<CType> right_values;
+  right_values.reserve(static_cast<size_t>(right_length));
+  for (int64_t idx = 0; idx < right_length; ++idx) {
     if (!right.IsNull(idx)) {
       right_values.insert(right_raw[idx]);
     }
   }
-
   if (right_values.empty()) {
-    return 1.0;  // nothing to match against -> behave as if mismatch heavy
+    return 1.0;
   }
 
   const int64_t left_length = left.length();
@@ -107,20 +99,17 @@ double EstimateMismatchRateTyped(const arrow::NumericArray<ArrowType>& left,
     return 0.0;
   }
 
-  size_t left_target = static_cast<size_t>(std::min<int64_t>(kMaxLeftSample, left_length));
-  int64_t left_step = std::max<int64_t>(1, left_length / static_cast<int64_t>(left_target));
-
   const CType* left_raw = left.raw_values();
   size_t considered = 0;
   size_t misses = 0;
-  for (int64_t idx = 0; idx < left_length && considered < left_target; idx += left_step) {
+  for (int64_t idx = 0; idx < left_length; ++idx) {
     if (left.IsNull(idx)) {
       continue;
     }
+    ++considered;
     if (right_values.find(left_raw[idx]) == right_values.end()) {
       ++misses;
     }
-    ++considered;
   }
 
   if (considered == 0) {
@@ -263,7 +252,6 @@ arrow::Result<std::shared_ptr<partition::Partitioner>> PaperJoinDpu::do_partitio
 }
 
 arrow::Result<PaperJoinResult> PaperJoinDpu::Run() {
-  bloom_skipped_total_ = 0;
   auto result = Run_internal();
   system_.async().sync();
   return result;
@@ -339,14 +327,9 @@ arrow::Result<PaperJoinResult> PaperJoinDpu::Run_internal() {
       buffer_partitioned_length_param_right);
 
   std::vector<int32_t> kernel_param_build{KernelHashBuild};
-  std::vector<int32_t> kernel_param_probe{KernelHashProbe};
+  std::vector<int32_t> kernel_param_bloom{KernelBloomProfile};
 
-  std::vector<std::vector<uint32_t>> selection_buffers(system_.dpus().size());
-  std::vector<uint32_t> selection_lengths(system_.dpus().size(), 0);
-
-  std::mutex stats_mutex;
-  uint64_t total_matches = 0;
-  uint64_t total_mismatches = 0;
+  PaperJoinResult accum{};
 
   for (size_t batches_offset = 0; batches_offset < n_partitions; batches_offset += nr_dpus) {
     const size_t batch_index = batches_offset / nr_dpus;
@@ -370,96 +353,51 @@ arrow::Result<PaperJoinResult> PaperJoinDpu::Run_internal() {
       std::cout << "[PaperJoin] batch " << batch_index
                 << " build finished in " << to_ms(build_end - batch_start)
                 << " ms" << std::endl;
-      std::cout << "[PaperJoin] batch " << batch_index << " probe start" << std::endl;
+      std::cout << "[PaperJoin] batch " << batch_index << " bloom profile start" << std::endl;
     }
-    system_.async().copy("kernel", 0, kernel_param_probe, sizeof(int32_t));
+    system_.async().copy("kernel", 0, kernel_param_bloom, sizeof(int32_t));
     system_.async().copy_from("buffer_length", buffer_partitioned_length_param_left,
                               batches_offset);
     ARROW_RETURN_NOT_OK(arrow_copy_to_dpus(system_, "buffer", left_partitions, batches_offset,
                                            fk_column_index, true));
     system_.async().exec();
-    if (verbose) {
-      std::cout << "[PaperJoin] batch " << batch_index
-                << " probe exec issued" << std::endl;
-    }
     system_.async().sync();
+    auto profile_end = time_now();
+
+    std::vector<std::vector<bloom_profile_counters_t>> bloom_profiles(system_.dpus().size());
+    for (auto& counters : bloom_profiles) {
+      counters.resize(1);
+    }
+    system_.copy(bloom_profiles, "bloom_profile_counters");
+
+    uint64_t batch_total = 0;
+    uint64_t batch_skipped = 0;
+    uint64_t batch_false_positive = 0;
+    uint64_t batch_matches = 0;
+    for (const auto& per_dpu : bloom_profiles) {
+      const auto& counters = per_dpu.front();
+      batch_total += counters.total_probes;
+      batch_skipped += counters.bloom_skipped;
+      batch_false_positive += counters.bloom_false_positives;
+      batch_matches += counters.matches;
+    }
+
+    accum.total_probes += batch_total;
+    accum.bloom_skipped += batch_skipped;
+    accum.bloom_false_positives += batch_false_positive;
+    accum.matches += batch_matches;
+
     if (verbose) {
+      const auto mismatches = batch_total - batch_matches;
       std::cout << "[PaperJoin] batch " << batch_index
-                << " probe sync completed" << std::endl;
-    }
-    auto probe_end = time_now();
-    if (verbose) {
+                << " bloom profile finished in " << to_ms(profile_end - build_end)
+                << " ms (total=" << batch_total
+                << ", matches=" << batch_matches
+                << ", mismatches=" << mismatches
+                << ", bloom_skipped=" << batch_skipped
+                << ", bloom_false_positive=" << batch_false_positive << ")" << std::endl;
       std::cout << "[PaperJoin] batch " << batch_index
-                << " probe finished in " << to_ms(probe_end - build_end)
-                << " ms" << std::endl;
-      std::cout << "[PaperJoin] batch " << batch_index << " gather start" << std::endl;
-    }
-
-    uint64_t local_matches = 0;
-    uint64_t local_mismatches = 0;
-    size_t global_dpu = 0;
-    uint32_t max_length = 0;
-    for (size_t rank_id = 0; rank_id < system_.ranks().size(); ++rank_id) {
-      const auto& rank = system_.ranks()[rank_id];
-      for (size_t local = 0; local < rank->dpus().size(); ++local, ++global_dpu) {
-        auto global_index = batches_offset + dpu_offset[rank_id] + local;
-        auto length = buffer_partitioned_length_param_left[global_index][0];
-        selection_lengths[global_dpu] = length;
-        max_length = std::max(max_length, length);
-      }
-    }
-
-    size_t aligned_length = (max_length + 1u) & ~1u;
-    if (aligned_length > 0) {
-      for (auto& buffer : selection_buffers) {
-        buffer.resize(aligned_length);
-      }
-      system_.copy(selection_buffers, "selection_indices_vector");
-    }
-
-    global_dpu = 0;
-    for (size_t rank_id = 0; rank_id < system_.ranks().size(); ++rank_id) {
-      const auto& rank = system_.ranks()[rank_id];
-      for (size_t local = 0; local < rank->dpus().size(); ++local, ++global_dpu) {
-        auto length = selection_lengths[global_dpu];
-        const auto& buffer = selection_buffers[global_dpu];
-        for (uint32_t idx = 0; idx < length; ++idx) {
-          if (buffer[idx] == UINT32_MAX) {
-            ++local_mismatches;
-          } else {
-            ++local_matches;
-          }
-        }
-      }
-    }
-    {
-      std::lock_guard<std::mutex> lock(stats_mutex);
-      total_matches += local_matches;
-      total_mismatches += local_mismatches;
-    }
-
-    std::vector<std::vector<uint32_t>> bloom_counts(system_.dpus().size());
-    for (auto& counts : bloom_counts) {
-      counts.resize(1);
-    }
-    system_.copy(bloom_counts, "bloom_skipped");
-    uint64_t local_sum = 0;
-    for (const auto& counts : bloom_counts) {
-      local_sum += counts[0];
-    }
-    if (local_sum > 0) {
-      std::lock_guard<std::mutex> lock(bloom_mutex_);
-      bloom_skipped_total_ += local_sum;
-    }
-    auto gather_end = time_now();
-    if (verbose) {
-      std::cout << "[PaperJoin] batch " << batch_index
-                << " gather finished in " << to_ms(gather_end - probe_end)
-                << " ms (matches=" << local_matches
-                << ", mismatches=" << local_mismatches
-                << ", bloom_skipped_increment=" << local_sum << ")" << std::endl;
-      std::cout << "[PaperJoin] batch " << batch_index
-                << " total batch time " << to_ms(gather_end - batch_start)
+                << " total batch time " << to_ms(profile_end - batch_start)
                 << " ms" << std::endl;
     }
   }
@@ -467,18 +405,19 @@ arrow::Result<PaperJoinResult> PaperJoinDpu::Run_internal() {
   system_.async().sync();
 
   PaperJoinResult result{};
-  result.matches = total_matches;
-  result.mismatches = total_mismatches;
-  {
-    std::lock_guard<std::mutex> lock(bloom_mutex_);
-    result.bloom_skipped = bloom_skipped_total_;
-  }
+  result.total_probes = accum.total_probes;
+  result.matches = accum.matches;
+  result.mismatches = accum.total_probes - accum.matches;
+  result.bloom_skipped = accum.bloom_skipped;
+  result.bloom_false_positives = accum.bloom_false_positives;
   if (verbose) {
     std::cout << "[PaperJoin] run finished in "
               << to_ms(time_now() - run_start) << " ms"
-              << " (matches=" << result.matches
+              << " (total=" << result.total_probes
+              << ", matches=" << result.matches
               << ", mismatches=" << result.mismatches
-              << ", bloom_skipped=" << result.bloom_skipped << ")" << std::endl;
+              << ", bloom_skipped=" << result.bloom_skipped
+              << ", bloom_false_positive=" << result.bloom_false_positives << ")" << std::endl;
   }
   return result;
 }
