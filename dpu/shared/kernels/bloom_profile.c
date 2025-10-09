@@ -69,6 +69,8 @@ int kernel_bloom_profile(uint32_t tasklet_id, __mram_ptr T* buffer,
     mutex_unlock(bloom_mutex);
   }
 
+  // hot filter not used in profiling
+
   barrier_wait(&barrier);
 
   return 0;

@@ -25,6 +25,8 @@ namespace upmemeval {
 
 namespace join {
 
+constexpr uint32_t kHotFilterTasklets = 8;
+
 #define ASYNC_TIMER(timer_name, code) \
   start_async_timer(timer_name);      \
   code;                               \
@@ -317,6 +319,8 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run() {
   {
     std::lock_guard<std::mutex> lock(bloom_mutex_);
     bloom_skipped_total_ = 0;
+    hot_filter_hits_total_ = 0;
+    hot_filter_misses_total_ = 0;
   }
   start_async_timer("outer");
   auto result = Run_internal();
@@ -471,13 +475,37 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
         counts.resize(1);
       }
       system_.copy(bloom_counts, "bloom_skipped");
-      uint64_t local = 0;
+      uint64_t local_skipped = 0;
       for (const auto& counts : bloom_counts) {
-        local += counts[0];
+        local_skipped += counts[0];
       }
-      if (local > 0) {
+
+      std::vector<std::vector<uint32_t>> hot_hits(system_.dpus().size());
+      std::vector<std::vector<uint32_t>> hot_misses(system_.dpus().size());
+      for (auto& hits : hot_hits) {
+        hits.resize(kHotFilterTasklets);
+      }
+      for (auto& misses : hot_misses) {
+        misses.resize(kHotFilterTasklets);
+      }
+      system_.copy(hot_hits, "hot_filter_hits");
+      system_.copy(hot_misses, "hot_filter_misses");
+      uint64_t local_hits = 0;
+      uint64_t local_misses = 0;
+      for (size_t rank = 0; rank < hot_hits.size(); ++rank) {
+        for (uint32_t value : hot_hits[rank]) {
+          local_hits += value;
+        }
+        for (uint32_t value : hot_misses[rank]) {
+          local_misses += value;
+        }
+      }
+
+      if (local_skipped > 0 || local_hits > 0 || local_misses > 0) {
         std::lock_guard<std::mutex> lock(bloom_mutex_);
-        bloom_skipped_total_ += local;
+        bloom_skipped_total_ += local_skipped;
+        hot_filter_hits_total_ += local_hits;
+        hot_filter_misses_total_ += local_misses;
       }
 
       stop_async_timer("probe");
@@ -618,6 +646,27 @@ arrow::Result<std::shared_ptr<arrow::Table>> JoinDpu::Run_internal() {
   }()));
 
   stop_async_timer("full");
+
+  uint64_t hot_hits_total = 0;
+  uint64_t hot_misses_total = 0;
+  {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    hot_hits_total = hot_filter_hits_total_;
+    hot_misses_total = hot_filter_misses_total_;
+  }
+  if (hot_hits_total + hot_misses_total > 0) {
+    double rate = static_cast<double>(hot_hits_total) * 100.0 /
+                  static_cast<double>(hot_hits_total + hot_misses_total);
+    std::cout << std::fixed << std::setprecision(2)
+              << "[Bloom] hot-filter hits=" << hot_hits_total
+              << " misses=" << hot_misses_total
+              << " hit_rate=" << rate << "%" << std::endl;
+    if (rate < 50.0) {
+      std::cout << "[Bloom] hot-filter hit rate below 50%; consider disabling Bloom for this workload."
+                << std::endl;
+    }
+    std::cout << std::defaultfloat;
+  }
 
   return ::arrow::Table::FromRecordBatches(std::move(record_batches)).ValueOrDie();
 }

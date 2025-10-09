@@ -11,7 +11,7 @@ set(CMAKE_C_FLAGS_DEBUG "-Wall -Wextra -g -Og")
 set(CMAKE_C_FLAGS_RELEASE "-Wall -Wextra -g0 -O3")
 
 if(NOT DEFINED NR_TASKLETS)
-  set(NR_TASKLETS 16)
+  set(NR_TASKLETS 8)
 endif()
 
 # DPU Join Kernels

@@ -60,6 +60,8 @@ __mram_noinit uint8_t bloom_bits[MAX_BLOOM_BITS / 8];
 __host uint32_t bloom_n_bits = 0; // actual n_bits used (host will set)
 __host uint32_t bloom_skipped = 0;
 __host bloom_profile_counters_t bloom_profile_counters;
+__host uint32_t hot_filter_hits[NR_TASKLETS];
+__host uint32_t hot_filter_misses[NR_TASKLETS];
 
 // Shared hash table
 hash_table_t hashtable;
@@ -123,6 +125,12 @@ int main() {
       assert("nr_partitions must be at least 2" && INPUT.nr_partitions >= 2);
       assert("nr_partitions must be a power of two" &&
             INPUT.nr_partitions == ROUND_UP_TO_POWER_OF_2(INPUT.nr_partitions));
+    }
+    if (kernel == KernelHashProbe || kernel == KernelBloomProfile) {
+      for (uint32_t i = 0; i < NR_TASKLETS; ++i) {
+        hot_filter_hits[i] = 0;
+        hot_filter_misses[i] = 0;
+      }
     }
   }
   barrier_wait(&barrier);

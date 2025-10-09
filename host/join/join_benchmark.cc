@@ -244,10 +244,10 @@ std::vector<JoinBenchmarkConfig> BuildJoinDpuBenchmarkConfigs() {
 
   const int64_t hardware_limit = 64;
   const int64_t max_dpus = hardware_limit;
-const std::array<int64_t, 5> dpus_values = {4, 8, 16, 32, 64};
+const std::array<int64_t, 1> dpus_values = {2};
 const std::array<int64_t, 1> scale_multipliers = {1};
-const std::array<int64_t, 3> batch_rows = {128LL << 10, 256LL << 10, 512LL << 10};
-const std::array<double, 3> bloom_thresholds = {0.0, 0.299, 1};
+const std::array<int64_t, 3> batch_rows = {56LL << 10, 128LL << 10, 256LL << 10};
+const std::array<double, 3> bloom_thresholds = {0.0};
 
   for (int64_t dpus : dpus_values) {
     int64_t normalized_dpus = NormalizeDpuCount(dpus, max_dpus);
