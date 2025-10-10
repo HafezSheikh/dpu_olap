@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "dpuext/api.h"
 #include "generator/generator.h"
+#include "join/join_profiles.h"
 #include "paper_join_dpu.h"
 
 namespace {
@@ -56,49 +59,54 @@ void BM_PaperJoin(benchmark::State& state) {
   for (auto _ : state) {
     state.PauseTiming();
 
-    arrow::random::RandomArrayGenerator rng_right(state.iterations() + 42);
-    arrow::random::RandomArrayGenerator rng_left(state.iterations() + 1337);
+    auto scenario = upmemeval::join::ResolveScenarioConfig(
+        std::optional<double>(params.fk_outside_ratio));
+    upmemeval::join::GeneratedJoinData generated;
+    try {
+      generated = upmemeval::join::GenerateJoinData(
+          scenario, params.batches, params.batch_rows, params.batch_rows);
+    } catch (const std::exception& e) {
+      state.SkipWithError(e.what());
+      return;
+    }
 
-    auto right_schema =
-        arrow::schema({arrow::field("payload", arrow::uint32(), false)});
-    auto right_batches_base = upmemeval::generator::MakeRandomRecordBatches(
-        rng_right, right_schema, static_cast<int>(params.batches),
-        static_cast<int>(params.batch_rows));
-    auto right_pk_column = upmemeval::generator::MakeIndexColumn(
-                                   static_cast<int>(params.batches),
-                                   static_cast<int>(params.batch_rows))
-                               .ValueOrDie();
-    auto right_batches = upmemeval::generator::AddColumn(
-        "pk", right_batches_base, right_pk_column);
-    auto right_schema_with_pk = right_batches[0]->schema();
-
-    auto left_schema =
-        arrow::schema({arrow::field("payload", arrow::uint32(), false)});
-    auto left_batches_base = upmemeval::generator::MakeRandomRecordBatches(
-        rng_left, left_schema, static_cast<int>(params.batches),
-        static_cast<int>(params.batch_rows));
-    std::pair<uint64_t, uint64_t> counts{0, 0};
-    auto left_fk_column = upmemeval::generator::MakeForeignKeyColumn(
-                                   rng_left, static_cast<uint32_t>(params.batch_rows),
-                                   static_cast<int32_t>(params.batches),
-                                   static_cast<int32_t>(params.batch_rows),
-                                   params.fk_outside_ratio, &counts)
-                               .ValueOrDie();
-    auto left_batches = upmemeval::generator::AddColumn(
-        "fk", left_batches_base, left_fk_column);
-    auto left_schema_with_fk = left_batches[0]->schema();
+    auto left_schema_with_fk = generated.left_schema;
+    auto right_schema_with_pk = generated.right_schema;
+    auto& left_batches = generated.left_batches;
+    auto& right_batches = generated.right_batches;
 
     double actual_ratio = 0.0;
-    uint64_t total_pairs = counts.first + counts.second;
-    if (total_pairs > 0) {
-      actual_ratio = static_cast<double>(counts.second) / static_cast<double>(total_pairs);
+    double null_ratio = 0.0;
+    double hot_ratio = 0.0;
+    double hot_miss_ratio = 0.0;
+    double considered = static_cast<double>(generated.stats.inside + generated.stats.outside);
+    double total = static_cast<double>(generated.stats.total());
+    if (considered > 0.0) {
+      actual_ratio = static_cast<double>(generated.stats.outside) / considered;
+    }
+    if (total > 0.0) {
+      null_ratio = static_cast<double>(generated.stats.nulls) / total;
+    }
+    if (generated.stats.inside > 0) {
+      hot_ratio = static_cast<double>(generated.stats.hot) /
+                  static_cast<double>(generated.stats.inside);
+    }
+    if (generated.stats.outside > 0) {
+      hot_miss_ratio = static_cast<double>(generated.stats.miss_hot) /
+                       static_cast<double>(generated.stats.outside);
     }
 
     if (first_iteration && state.thread_index() == 0) {
-      std::cout << "[Generator] batches=" << params.batches
+      std::cout << "[Generator(" << "paper," << upmemeval::join::ProfileTag(scenario.profile)
+                << ")] batches=" << params.batches
                 << " batch_rows=" << params.batch_rows
                 << " fk_outside_ratio_requested=" << params.fk_outside_ratio
-                << " actual=" << actual_ratio << std::endl;
+                << " actual=" << actual_ratio
+                << " null_ratio=" << null_ratio
+                << " hot_share=" << hot_ratio
+                << " hot_miss_share=" << hot_miss_ratio << std::endl;
+      std::cout << "[Generator] profile_desc=" << upmemeval::join::ProfileDescription(scenario.profile)
+                << std::endl;
     }
 
     auto system = dpu::DpuSet::allocate(

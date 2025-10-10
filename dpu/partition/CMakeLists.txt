@@ -11,7 +11,7 @@ set(CMAKE_C_FLAGS_DEBUG "-Wall -Wextra -O0 -g")
 set(CMAKE_C_FLAGS_RELEASE "-Wall -Wextra -g0 -O3")
 
 if(NOT DEFINED NR_TASKLETS)
-  set(NR_TASKLETS 16)
+  set(NR_TASKLETS 8)
 endif()
 
 set(DPU_PARTITION_SOURCES

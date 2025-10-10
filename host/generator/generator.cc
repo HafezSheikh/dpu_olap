@@ -3,10 +3,11 @@
 #include <arrow/testing/random.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
-#include <random>
 #include <limits>
+#include <random>
 
 namespace upmemeval {
 
@@ -51,18 +52,66 @@ arrow::RecordBatchVector AddColumn(const std::string& name,
 
 arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
     ::arrow::random::RandomArrayGenerator& g, uint32_t pk_batch_size, int32_t num_batches,
-    int32_t batch_size, double outside_ratio,
-    std::pair<uint64_t, uint64_t>* counts) {
+    int32_t batch_size, const ForeignKeyConfig& config, ForeignKeyStats* stats_ptr) {
   arrow::ArrayVector out(num_batches);
 
-  std::mt19937_64 rng(42);
-  uint64_t total_inside = 0;
-  uint64_t total_outside = 0;
+  ForeignKeyStats local_stats;
+  ForeignKeyStats* stats = stats_ptr != nullptr ? stats_ptr : &local_stats;
+  if (stats_ptr != nullptr) {
+    *stats_ptr = ForeignKeyStats{};
+  }
+
+  std::mt19937_64 rng(config.seed);
+  const double outside_ratio = std::clamp(config.outside_ratio, 0.0, 1.0);
+  const double null_ratio = std::clamp(config.null_ratio, 0.0, 1.0);
+  const double hot_probability = std::clamp(config.hot_probability, 0.0, 1.0);
+  double hot_key_fraction = std::clamp(config.hot_key_fraction, 0.0, 1.0);
+  const double miss_hot_probability =
+      std::clamp(config.miss_hot_probability, 0.0, 1.0);
+  double miss_hot_key_fraction = std::clamp(config.miss_hot_key_fraction, 0.0, 1.0);
+  if (hot_probability == 0.0 || pk_batch_size == 0) {
+    hot_key_fraction = 0.0;
+  }
+  if (miss_hot_probability == 0.0 || pk_batch_size == 0) {
+    miss_hot_key_fraction = 0.0;
+  }
 
   const uint64_t global_span = static_cast<uint64_t>(num_batches) * pk_batch_size;
   const bool use_high_bit_escape = global_span < (1ull << 31);
   std::uniform_int_distribution<uint32_t> outside_dist_global(
       0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
+
+  uint32_t hot_span = 0;
+  if (hot_key_fraction > 0.0) {
+    double scaled = static_cast<double>(pk_batch_size) * hot_key_fraction;
+    hot_span = static_cast<uint32_t>(std::max<double>(1.0, std::floor(scaled + 0.5)));
+    hot_span = std::min<uint32_t>(hot_span, pk_batch_size == 0 ? 0 : pk_batch_size);
+  }
+
+  uint32_t miss_span = 0;
+  uint32_t miss_pool_base = 0;
+  std::uniform_int_distribution<uint32_t> miss_hot_dist;
+  bool use_hot_miss_pool = false;
+  if (miss_hot_probability > 0.0 && miss_hot_key_fraction > 0.0) {
+    double scaled = static_cast<double>(pk_batch_size) * miss_hot_key_fraction;
+    miss_span = static_cast<uint32_t>(std::max<double>(1.0, std::floor(scaled + 0.5)));
+    if (pk_batch_size > 0) {
+      miss_span = std::min<uint32_t>(miss_span, pk_batch_size);
+    }
+    miss_span = std::max<uint32_t>(1U, miss_span);
+    if (use_high_bit_escape) {
+      miss_pool_base = 1u << 31;
+    } else {
+      uint64_t tentative_base = global_span;
+      uint64_t max_value = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+      if (tentative_base + miss_span > max_value) {
+        tentative_base = max_value - miss_span;
+      }
+      miss_pool_base = static_cast<uint32_t>(tentative_base);
+    }
+    miss_hot_dist = std::uniform_int_distribution<uint32_t>(0, miss_span - 1);
+    use_hot_miss_pool = true;
+  }
 
   for (int32_t batch = 0; batch < num_batches; ++batch) {
     arrow::UInt32Builder builder;
@@ -70,35 +119,69 @@ arrow::Result<arrow::ArrayVector> MakeForeignKeyColumn(
 
     uint32_t pk_base = static_cast<uint32_t>(batch) * pk_batch_size;
     std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
-    std::uniform_int_distribution<uint32_t> inside_dist(0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
-    std::uniform_int_distribution<uint32_t> outside_dist(0, pk_batch_size > 0 ? pk_batch_size - 1 : 0);
+    std::uniform_int_distribution<uint32_t> inside_dist;
+    std::uniform_int_distribution<uint32_t> hot_dist;
+    if (pk_batch_size > 0) {
+      inside_dist = std::uniform_int_distribution<uint32_t>(0, pk_batch_size - 1);
+    }
+    if (hot_span > 0) {
+      hot_dist = std::uniform_int_distribution<uint32_t>(0, hot_span - 1);
+    }
 
     for (int32_t row = 0; row < batch_size; ++row) {
-      uint32_t value;
-      if (pk_batch_size == 0 || prob_dist(rng) >= outside_ratio) {
-        value = pk_base + inside_dist(rng);
-        ++total_inside;
-      } else {
-        if (use_high_bit_escape) {
-          value = (1u << 31) | outside_dist_global(rng);
-        } else {
-          uint64_t candidate = global_span + outside_dist_global(rng);
-          if (candidate > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
-            candidate = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
-          }
-          value = static_cast<uint32_t>(candidate);
-        }
-        ++total_outside;
+      if (null_ratio > 0.0 && prob_dist(rng) < null_ratio) {
+        builder.UnsafeAppendNull();
+        stats->nulls++;
+        continue;
       }
+
+      bool choose_outside = pk_batch_size == 0;
+      if (!choose_outside && outside_ratio > 0.0) {
+        choose_outside = prob_dist(rng) < outside_ratio;
+      }
+
+      if (choose_outside) {
+        uint32_t value;
+        bool take_hot_miss = use_hot_miss_pool && (prob_dist(rng) < miss_hot_probability);
+        if (take_hot_miss) {
+          uint32_t miss_offset = miss_hot_dist(rng);
+          value = use_high_bit_escape ? (miss_pool_base | miss_offset)
+                                      : static_cast<uint32_t>(miss_pool_base + miss_offset);
+          stats->miss_hot++;
+        } else {
+          if (use_high_bit_escape) {
+            value = (1u << 31) | outside_dist_global(rng);
+          } else {
+            uint64_t candidate = global_span + outside_dist_global(rng);
+            if (candidate > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+              candidate = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+            }
+            value = static_cast<uint32_t>(candidate);
+          }
+        }
+        builder.UnsafeAppend(value);
+        stats->outside++;
+        continue;
+      }
+
+      bool counted_hot = false;
+      uint32_t offset = 0;
+      if (hot_span > 0 && prob_dist(rng) < hot_probability) {
+        offset = hot_dist(rng);
+        counted_hot = true;
+      } else if (pk_batch_size > 0) {
+        offset = inside_dist(rng);
+      }
+
+      uint32_t value = pk_base + offset;
       builder.UnsafeAppend(value);
+      stats->inside++;
+      if (counted_hot) {
+        stats->hot++;
+      }
     }
 
     ARROW_ASSIGN_OR_RAISE(out[batch], builder.Finish());
-  }
-
-  if (counts != nullptr) {
-    counts->first = total_inside;
-    counts->second = total_outside;
   }
 
   return out;

@@ -14,6 +14,8 @@
 extern mutex_id_t bloom_mutex;
 extern uint32_t bloom_skipped;
 extern barrier_t barrier;
+extern uint32_t hot_filter_hits[NR_TASKLETS];
+extern uint32_t hot_filter_misses[NR_TASKLETS];
 
 int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer_length,
                       hash_table_t* hashtable,
@@ -30,8 +32,11 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
 
   // Bloom filter view
   bloom_t bf;
+  hot_filter_t* hot_filter = NULL;
   if (bloom_n_bits > 0) {
     bloom_init(&bf, bloom_bits, bloom_n_bits);
+    hot_filter = (hot_filter_t*)mem_alloc(sizeof(hot_filter_t));
+    hot_filter_init(hot_filter);
   }
 
   uint32_t skipped_local = 0;
@@ -51,9 +56,17 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
 
     for (unsigned int i = 0; i < max; ++i) {
       T item = input_cache[i];
+      if (hot_filter && hot_filter_contains(hot_filter, (uint32_t)item)) {
+        skipped_local++;
+        output_cache[i] = UINT32_MAX;
+        continue;
+      }
 
       // Bloom check first
       if (bloom_n_bits > 0 && !bloom_maybe_contains_u64(&bf, (uint64_t)item)) {
+        if (hot_filter) {
+          hot_filter_insert(hot_filter, (uint32_t)item);
+        }
         // Definitely not present
         skipped_local++;
         output_cache[i] = UINT32_MAX;  // sentinel for "no match"
@@ -65,6 +78,9 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
       if (ok) {
         output_cache[i] = index;
       } else {
+        if (hot_filter) {
+          hot_filter_insert(hot_filter, (uint32_t)item);
+        }
         output_cache[i] = UINT32_MAX;  // handle not found
       }
     }
@@ -80,6 +96,17 @@ int kernel_hash_probe(uint32_t tasklet_id, __mram_ptr T* buffer, uint32_t buffer
     mutex_lock(bloom_mutex);
     bloom_skipped += skipped_local;
     mutex_unlock(bloom_mutex);
+  }
+  if (bloom_n_bits > 0 && hot_filter != NULL) {
+    uint32_t total = hot_filter->hits + hot_filter->misses;
+    float rate = total ? (100.0f * (float)hot_filter->hits / (float)total) : 100.0f;
+    trace("Tasklet %d hot miss filter hits=%u misses=%u hit_rate=%.2f%%\n", tasklet_id,
+          hot_filter->hits, hot_filter->misses, rate);
+    hot_filter_hits[tasklet_id] = hot_filter->hits;
+    hot_filter_misses[tasklet_id] = hot_filter->misses;
+  } else {
+    hot_filter_hits[tasklet_id] = 0;
+    hot_filter_misses[tasklet_id] = 0;
   }
   if (tasklet_id == 0) {
     trace("Tasklet %d bloom skipped local=%u total=%u\n", tasklet_id, skipped_local, bloom_skipped);

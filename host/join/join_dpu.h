@@ -37,6 +37,8 @@ class JoinDpu {
   arrow::RecordBatchVector right_batches_;
   std::shared_ptr<timer::Timers> timers_;
   uint64_t bloom_skipped_total_ = 0;
+  uint64_t hot_filter_hits_total_ = 0;
+  uint64_t hot_filter_misses_total_ = 0;
   mutable std::mutex bloom_mutex_;
 
   arrow::Result<std::shared_ptr<partition::Partitioner>> do_partition(
@@ -53,6 +55,16 @@ class JoinDpu {
   uint64_t BloomSkipped() const {
     std::lock_guard<std::mutex> lock(bloom_mutex_);
     return bloom_skipped_total_;
+  }
+
+  uint64_t HotFilterHits() const {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    return hot_filter_hits_total_;
+  }
+
+  uint64_t HotFilterMisses() const {
+    std::lock_guard<std::mutex> lock(bloom_mutex_);
+    return hot_filter_misses_total_;
   }
 };
 
