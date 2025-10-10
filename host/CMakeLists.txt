@@ -69,6 +69,7 @@ set(paper_join_common_sources
     paper_join/paper_join_dpu.cc
     generator/generator.cc
     generator/random.cc
+    join/join_profiles.cc
     partition/partition.cc
     partition/partitioner.cc
     dpuext/arrow_utils.cc)

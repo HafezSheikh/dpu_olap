@@ -2,8 +2,10 @@
 #include <benchmark/benchmark.h>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
@@ -29,6 +31,7 @@
 
 #include "join_dpu.h"
 #include "join_native.h"
+#include "join_profiles.h"
 
 using namespace dpu;
 
@@ -40,6 +43,12 @@ using namespace timer;
 namespace join {
 
 namespace {
+
+using join::GenerateJoinData;
+using join::JoinDataProfile;
+using join::JoinScenarioConfig;
+using join::ProfileDescription;
+using join::ProfileTag;
 
 struct ScopedEnv {
   struct Entry {
@@ -117,10 +126,13 @@ struct CacheKey {
   int64_t left_rows;
   int64_t right_rows;
   int64_t ratio_milli;
+  JoinDataProfile profile;
 
   bool operator<(const CacheKey& other) const {
-    return std::tie(batches, left_rows, right_rows, ratio_milli) <
-           std::tie(other.batches, other.left_rows, other.right_rows, other.ratio_milli);
+    return std::make_tuple(batches, left_rows, right_rows, ratio_milli,
+                           static_cast<int>(profile)) <
+           std::make_tuple(other.batches, other.left_rows, other.right_rows, other.ratio_milli,
+                           static_cast<int>(other.profile));
   }
 };
 
@@ -129,8 +141,8 @@ struct CachedJoinData {
   std::shared_ptr<arrow::Schema> right_schema;
   arrow::RecordBatchVector left_batches;
   arrow::RecordBatchVector right_batches;
-  uint64_t inside = 0;
-  uint64_t outside = 0;
+  generator::ForeignKeyStats stats;
+  JoinDataProfile profile = JoinDataProfile::Uniform;
 };
 
 static std::mutex g_join_cache_mutex;
@@ -154,7 +166,7 @@ std::filesystem::path CacheDirectory() {
 std::string CacheFileBase(const CacheKey& key) {
   std::ostringstream oss;
   oss << "b" << key.batches << "_l" << key.left_rows << "_r" << key.right_rows << "_ratio"
-      << key.ratio_milli;
+      << key.ratio_milli << "_" << ProfileTag(key.profile);
   return oss.str();
 }
 
@@ -200,7 +212,9 @@ arrow::Status WriteJoinDataToDisk(const CacheKey& key, const CachedJoinData& dat
 
   std::ofstream meta(meta_path);
   if (meta.is_open()) {
-    meta << data.inside << " " << data.outside;
+    meta << static_cast<int>(data.profile) << " " << data.stats.inside << " "
+         << data.stats.outside << " " << data.stats.nulls << " " << data.stats.hot
+         << " " << data.stats.miss_hot;
   }
   return arrow::Status::OK();
 }
@@ -222,10 +236,28 @@ arrow::Result<CachedJoinData> LoadJoinDataFromDisk(const CacheKey& key) {
   data.left_batches = std::move(left_pair.second);
   data.right_schema = right_pair.first;
   data.right_batches = std::move(right_pair.second);
+  data.stats = generator::ForeignKeyStats{};
+  data.profile = key.profile;
 
   std::ifstream meta(meta_path);
   if (meta.is_open()) {
-    meta >> data.inside >> data.outside;
+    int profile_serial = static_cast<int>(key.profile);
+    if (meta >> profile_serial >> data.stats.inside >> data.stats.outside >> data.stats.nulls >>
+            data.stats.hot >> data.stats.miss_hot) {
+      data.profile = static_cast<JoinDataProfile>(profile_serial);
+    } else {
+      meta.clear();
+      meta.seekg(0);
+      if (meta >> profile_serial >> data.stats.inside >> data.stats.outside >> data.stats.nulls >>
+              data.stats.hot) {
+        data.profile = static_cast<JoinDataProfile>(profile_serial);
+        data.stats.miss_hot = 0;
+      } else if (meta >> data.stats.inside >> data.stats.outside) {
+        data.stats.nulls = 0;
+        data.stats.hot = 0;
+        data.stats.miss_hot = 0;
+      }
+    }
   }
 
   return data;
@@ -375,13 +407,43 @@ class PartitionedBatchGeneratorFixture : public benchmark::Fixture {
     assert(left_batch_size > 0);
     assert(right_batch_size > 0);
 
-    double outside_ratio = 0.0;
+    std::optional<double> outside_override;
     if (const char* env = std::getenv("FK_OUTSIDE_RATIO")) {
-      outside_ratio = std::clamp(std::strtod(env, nullptr), 0.0, 1.0);
+      outside_override = std::clamp(std::strtod(env, nullptr), 0.0, 1.0);
     }
+
+    auto scenario = join::ResolveScenarioConfig(outside_override);
+    double outside_ratio = scenario.fk_config.outside_ratio;
     int64_t ratio_milli = static_cast<int64_t>(std::llround(outside_ratio * 1000.0));
 
-    CacheKey key{num_batches, left_batch_size, right_batch_size, ratio_milli};
+    CacheKey key{num_batches, left_batch_size, right_batch_size, ratio_milli, scenario.profile};
+
+    auto log_dataset = [&](const char* source, const CachedJoinData& data) {
+      if (state.thread_index() != 0) {
+        return;
+      }
+      double considered = static_cast<double>(data.stats.inside + data.stats.outside);
+      double total = static_cast<double>(data.stats.total());
+      double actual_outside = considered > 0.0 ? static_cast<double>(data.stats.outside) / considered
+                                              : 0.0;
+      double null_ratio = total > 0.0 ? static_cast<double>(data.stats.nulls) / total : 0.0;
+      double hot_ratio = data.stats.inside > 0
+                             ? static_cast<double>(data.stats.hot) / static_cast<double>(data.stats.inside)
+                             : 0.0;
+      double miss_hot_ratio = data.stats.outside > 0
+                                  ? static_cast<double>(data.stats.miss_hot) /
+                                        static_cast<double>(data.stats.outside)
+                                  : 0.0;
+      std::cout << "[Generator(" << source << "," << ProfileTag(data.profile) << ")] batches="
+                << num_batches << " left_rows=" << left_batch_size
+                << " right_rows=" << right_batch_size
+                << " requested_outside_ratio=" << outside_ratio
+                << " actual_outside_ratio=" << actual_outside
+                << " null_ratio=" << null_ratio
+                << " hot_share=" << hot_ratio
+                << " hot_miss_share=" << miss_hot_ratio << std::endl;
+      std::cout << "[Generator] profile_desc=" << ProfileDescription(data.profile) << std::endl;
+    };
 
     {
       std::lock_guard<std::mutex> lock(g_join_cache_mutex);
@@ -391,98 +453,59 @@ class PartitionedBatchGeneratorFixture : public benchmark::Fixture {
         right_batches_ = it->second.right_batches;
         left_schema_ = it->second.left_schema;
         right_schema_ = it->second.right_schema;
-        if (state.thread_index() == 0) {
-          uint64_t total = it->second.inside + it->second.outside;
-          double actual = total ? static_cast<double>(it->second.outside) / static_cast<double>(total) : 0.0;
-          std::cout << "[Generator(cache)] batches=" << num_batches
-                    << " left_rows=" << left_batch_size << " right_rows=" << right_batch_size
-                    << " outside_ratio_requested=" << outside_ratio << " actual=" << actual << std::endl;
-        }
+        log_dataset("cache", it->second);
         return;
       }
     }
 
     if (auto maybe_disk = LoadJoinDataFromDisk(key); maybe_disk.ok()) {
       CachedJoinData data = std::move(maybe_disk).ValueOrDie();
-      if (state.thread_index() == 0) {
-        uint64_t total = data.inside + data.outside;
-        double actual = total ? static_cast<double>(data.outside) / static_cast<double>(total) : 0.0;
-        std::cout << "[Generator(disk)] batches=" << num_batches << " left_rows=" << left_batch_size
-                  << " right_rows=" << right_batch_size << " outside_ratio_requested=" << outside_ratio
-                  << " actual=" << actual << std::endl;
-      }
+      data.profile = key.profile;
+      left_batches_ = data.left_batches;
+      right_batches_ = data.right_batches;
+      left_schema_ = data.left_schema;
+      right_schema_ = data.right_schema;
+      log_dataset("disk", data);
       {
         std::lock_guard<std::mutex> lock(g_join_cache_mutex);
-        auto [it, inserted] = g_join_cache.emplace(key, data);
-        left_batches_ = it->second.left_batches;
-        right_batches_ = it->second.right_batches;
-        left_schema_ = it->second.left_schema;
-        right_schema_ = it->second.right_schema;
+        g_join_cache.emplace(key, data);
       }
       return;
     }
 
-    arrow::random::RandomArrayGenerator rng_right(static_cast<int64_t>(num_batches * 1315423911ULL ^
-                                                                      left_batch_size * 2654435761ULL ^
-                                                                      right_batch_size * 97531ULL ^
-                                                                      ratio_milli));
-    arrow::random::RandomArrayGenerator rng_left(static_cast<int64_t>(num_batches * 89 +
-                                                                     left_batch_size * 53 +
-                                                                     right_batch_size * 97 +
-                                                                     ratio_milli));
-
-    auto right_schema = arrow::schema({arrow::field("x", arrow::uint32(), /*nullable=*/false)});
-    auto right_batches_base =
-        generator::MakeRandomRecordBatches(rng_right, right_schema, num_batches, right_batch_size);
-    auto right_pk_column = generator::MakeIndexColumn(num_batches, right_batch_size);
-    auto right_batches =
-        generator::AddColumn("pk", right_batches_base, right_pk_column.ValueOrDie());
-    auto right_schema_with_pk = right_batches[0]->schema();
-
-    auto left_schema = arrow::schema({arrow::field("y", arrow::uint32(), /*nullable=*/false)});
-    auto left_batches_base =
-        generator::MakeRandomRecordBatches(rng_left, left_schema, num_batches, left_batch_size);
-    std::pair<uint64_t, uint64_t> counts{0, 0};
-    auto left_fk_result = generator::MakeForeignKeyColumn(rng_left, right_batch_size, num_batches,
-                                                          left_batch_size, outside_ratio, &counts);
-    if (!left_fk_result.ok()) {
-      state.SkipWithError(left_fk_result.status().ToString().c_str());
+    join::GeneratedJoinData generated;
+    try {
+      generated = GenerateJoinData(scenario, num_batches, left_batch_size, right_batch_size);
+    } catch (const std::exception& e) {
+      state.SkipWithError(e.what());
       return;
     }
-    auto left_fk_column = left_fk_result.ValueOrDie();
-    auto left_batches =
-        generator::AddColumn("fk", left_batches_base, left_fk_column);
-    auto left_schema_with_fk = left_batches[0]->schema();
-
-    uint64_t total = counts.first + counts.second;
-    double actual_ratio = total ? static_cast<double>(counts.second) / static_cast<double>(total) : 0.0;
-    std::cout << "[Generator] batches=" << num_batches << " left_rows=" << left_batch_size
-              << " right_rows=" << right_batch_size << " outside_ratio_requested=" << outside_ratio
-              << " actual=" << actual_ratio << " (outside=" << counts.second
-              << ", inside=" << counts.first << ")" << std::endl;
 
     CachedJoinData data;
-    data.left_schema = left_schema_with_fk;
-    data.right_schema = right_schema_with_pk;
-    data.left_batches = left_batches;
-    data.right_batches = right_batches;
-    data.inside = counts.first;
-    data.outside = counts.second;
+    data.left_schema = generated.left_schema;
+    data.right_schema = generated.right_schema;
+    data.left_batches = generated.left_batches;
+    data.right_batches = generated.right_batches;
+    data.stats = generated.stats;
+    data.profile = scenario.profile;
 
     auto write_status = WriteJoinDataToDisk(key, data);
     if (!write_status.ok()) {
-      std::cerr << "[Generator] Warning: failed to write cache files: " << write_status.ToString()
-                << std::endl;
+      std::cerr << "[Generator] Warning: failed to write cache files: "
+                << write_status.ToString() << std::endl;
     }
+
+    left_batches_ = data.left_batches;
+    right_batches_ = data.right_batches;
+    left_schema_ = data.left_schema;
+    right_schema_ = data.right_schema;
 
     {
       std::lock_guard<std::mutex> lock(g_join_cache_mutex);
-      auto [it, inserted] = g_join_cache.emplace(key, data);
-      left_batches_ = it->second.left_batches;
-      right_batches_ = it->second.right_batches;
-      left_schema_ = it->second.left_schema;
-      right_schema_ = it->second.right_schema;
+      g_join_cache.emplace(key, data);
     }
+
+    log_dataset("new", data);
   }
 
   void TearDown(::benchmark::State&) override {
